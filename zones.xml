@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<zones>
+    <zone>
+        <OID>2668110083</OID>
+        <id>2279776</id>
+        <version>0</version>
+        <revision>1</revision>
+        <active>true</active>
+        <layerUpdateVersion>6627081</layerUpdateVersion>
+        <editable>true</editable>
+        <name>New Zone1</name>
+        <polygon>
+            <point x="496393.89" y="6362524.53" z="380.92"/>
+            <point x="496738.19" y="6362529.34" z="386.38"/>
+            <point x="496692.44" y="6362103.19" z="370.24"/>
+            <point x="496413.16" y="6362204.31" z="369.82"/>
+            <point x="496328.89" y="6362437.85" z="376.86"/>
+            <point x="496393.89" y="6362524.53" z="380.92"/>
+        </polygon>
+        <speedLimit magnitude="0.0" unit="kilometres per hour" unitType="speed"/>
+        <tractionLevel>100</tractionLevel>
+        <flags>
+            <bedDown>false</bedDown>
+            <level1EntryIncident>false</level1EntryIncident>
+            <level1ExitIncident>false</level1ExitIncident>
+            <beepIfOtherMachinesEnter>false</beepIfOtherMachinesEnter>
+            <beepIfOtherMachinesArePresent>false</beepIfOtherMachinesArePresent>
+            <silenceProximityAlarms>false</silenceProximityAlarms>
+            <silenceRadarAlarms>false</silenceRadarAlarms>
+            <mannedExclusionZone>false</mannedExclusionZone>
+            <cleanUp>false</cleanUp>
+            <canBeRemovedByPanel>false</canBeRemovedByPanel>
+            <autonomousInclusionZone>false</autonomousInclusionZone>
+            <autonomousExclusionZone>false</autonomousExclusionZone>
+            <multicastUpdateZone>false</multicastUpdateZone>
+            <passable>false</passable>
+            <outsideAOZ>false</outsideAOZ>
+        </flags>
+        <loadedSpeedLimit magnitude="0.0" unit="kilometres per hour" unitType="speed"/>
+        <automaticallyManaged>false</automaticallyManaged>
+        <barrier>false</barrier>
+        <displayColorRed>255</displayColorRed>
+        <displayColorBlue>255</displayColorBlue>
+        <displayColorGreen>255</displayColorGreen>
+        <displayColorAlpha>255</displayColorAlpha>
+        <createdDate>2026-08-10T15:39:48.521-06:00</createdDate>
+        <lastUpdatedDate>2026-08-10T15:39:48.521-06:00</lastUpdatedDate>
+    </zone>
+</zones>
