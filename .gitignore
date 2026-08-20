@@ -3,4 +3,5 @@ Kyles_code
 __pycache__
 .venv
 logs
-zones.xml
+output
+runtime
