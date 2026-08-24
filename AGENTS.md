@@ -40,7 +40,11 @@ Key settings (`config.ini`):
 * `[zone]` name prefix (`RacMonitorGen_zone`), `zone_size_metres` (100),
   `suppression_radius_metres` (300), `zones_refresh_interval_seconds` (300)
 * `[speed]` `default_speed_kmh`, `speed_offset_kmh` (10), `minimum_speed_kmh` (5)
-* `[minestar]` mstarrun path, `import_enabled`, `dry_run`, `import_workers`
+* `[minestar]` mstarrun path, `import_enabled`, `dry_run`, `show_only`,
+  `import_workers`
+* `[simulation]` `enabled`, `random_seed`, `spawn_per_cycle`,
+  `jitter_metres`, `level_min/max`, `speed_min/max`,
+  `time_window_minutes`, `hotspots` (`X,Y[,Level[,Speed]];...`)
 * `[display] enabled`
 
 ## Runtime flow (`app.py main()` → `run_cycle`)
@@ -72,15 +76,22 @@ Key settings (`config.ini`):
 8. **Import** is submitted to a single background `ThreadPoolExecutor` so
    MineStar commands are serialized while the map stays live. Successful
    imports are appended to the in-memory zone library so the same cycle
-   cannot create overlapping zones.
+   cannot create overlapping zones. **Show-only mode** (`[minestar]
+   show_only = true`) skips `import_zone`/mstarrun entirely and appends
+   the zone as a *proposed* `ExistingZone` (`proposed=True`) so it renders
+   on the map without creating anything; proposed zones also suppress
+   duplicates on later cycles.
 9. **Sample-commit semantics** — the snapshot commits as the next baseline
    *unless* the zone export failed or a real import failed, in which case
    it is withheld so those new events get retried next cycle.
 10. **Viewer** — live map: lanes drawn as a *cached* PatchCollection (only
-    rebuilt when lane data changes), RAC events coloured by severity, cyan
-    halos on new events, square zones + dashed suppression circles,
-    cluster hubs, and a side panel with a recent RAC event list
-    (time + X/Y + level + speed) and an activity log.
+    rebuilt when lane data changes), RAC events coloured by severity, square
+    zones + dashed suppression circles, cluster hubs, and a side data-entry
+    table listing the RAC events since start (time + X/Y + level + speed).
+    The severity legend sits on the **left** of the map and the map view is
+    **frozen** to a fixed extent once the site footprint is known. Zones
+    with `proposed=True` render green with a dashed edge and a "PROPOSED"
+    label; imported zones render magenta.
 
 ## Zone naming
 
@@ -96,6 +107,7 @@ duplicate suppression.
 | `app.py` | Main entry, cycle orchestration, background import, retry/commit logic. |
 | `config.py` | Config discovery (local → `%PUBLIC%\RACZoneGen`) + typed, validated settings. |
 | `database.py` | ODBC engine, RAC event reads (+ payload speed parsing), lane reads. |
+| `simulator.py` | `SimulatedDatabase` — fakes **only** the RAC event source (auto-spawns events at hotspots over time); lanes + existing zones are read live from the real MineStar SQL Server. |
 | `clustering.py` | `mark_new_events` + Kyle's hub-radius `find_clusters`. |
 | `minestar.py` | mstarrun commands, square zone XML generation, speed limit calc, import. |
 | `viewer.py` | Live matplotlib map + RAC event/activity side panel. |
@@ -112,11 +124,21 @@ duplicate suppression.
 ```powershell
 .venv\Scripts\Activate.ps1
 python app.py          # run from the project root
+python app.py --simulate --cycles 5   # synthetic RAC events, live lanes/zones
+python app.py --config config.ini --simulate   # explicit config file
 .\build_exe.bat        # produce dist\RACZoneGen.exe
 ```
 
-No test suite is configured; verification is manual against the live
-MineStar/SQL Server. `config.ini` ships with `import_enabled=false` /
+`--simulate` selects `SimulatedDatabase` (also activated by
+`[simulation] enabled = true`). Simulation fakes **only the RAC event
+stream** (an additive stream of synthetic events at the configured
+hotspots, so you can watch clusters form and zones get created/imported
+over time). Lanes and existing zones are read live from the MineStar SQL
+`mshist`/`msmodel`, so a real connection is still required. `--cycles N`
+runs exactly N cycles then exits, ideal for scripted/smoke runs.
+`--config PATH` overrides config discovery. No test suite is configured;
+verification is manual against the live MineStar/SQL Server, or scripted
+against the simulator. `config.ini` ships with `import_enabled=false` /
 `dry_run=true` — imports must be explicitly enabled and dry-run turned off
 to create real zones. `display.enabled` can be set to `false` for
 headless/service use.

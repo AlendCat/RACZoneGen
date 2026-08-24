@@ -29,6 +29,7 @@ import logging.handlers
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pandas as pd
 
@@ -40,6 +41,7 @@ from minestar import (
     MineStar,
     cluster_is_suppressed,
 )
+from simulator import SimulatedDatabase
 from viewer import Viewer, wait_for_next_cycle
 
 logger = logging.getLogger("rac_zone_monitor")
@@ -105,7 +107,7 @@ def wait_with_viewer(
 
 
 def _read_zones(
-    database: Database,
+    database: Database | SimulatedDatabase,
     minestar: MineStar,
     config: Config,
     viewer: Viewer | None,
@@ -142,9 +144,9 @@ def _read_zones(
 
 def run_cycle(
     config: Config,
-    database: Database,
+    database: Database | SimulatedDatabase,
     minestar: MineStar,
-    viewer: Viewer,
+    viewer: Viewer | None,
     executor: ThreadPoolExecutor,
     previous_event_counts: Counter | None,
     existing_zones: list,
@@ -249,6 +251,7 @@ def run_cycle(
         else:
             import_failed = False
             submitted = 0
+            proposed_shown = 0
 
             for cluster in actionable_clusters:
                 if cluster_is_suppressed(
@@ -290,6 +293,27 @@ def run_cycle(
                         else config.default_speed_kmh
                     ),
                 )
+
+                if config.show_only:
+                    # Show-only mode: never touch mstarrun.  The zone is
+                    # added to the in-memory library as a "proposed" zone
+                    # so the viewer draws it without creating anything.
+                    logger.info(
+                        "Show-only mode: zone %s displayed as PROPOSED, "
+                        "no mstarrun import.",
+                        zone_name,
+                    )
+                    existing_zones.append(
+                        ExistingZone(
+                            name=zone_name,
+                            center_x=cluster.center_x,
+                            center_y=cluster.center_y,
+                            half_size=config.zone_size_metres / 2.0,
+                            proposed=True,
+                        )
+                    )
+                    proposed_shown += 1
+                    continue
 
                 future = executor.submit(minestar.import_zone, xml_file)
                 cluster._import_future = future  # type: ignore[attr-defined]
@@ -336,11 +360,18 @@ def run_cycle(
                 elif status == "failed":
                     import_failed = True
 
-            logger.info(
-                "%d zone(s) submitted for import, %d result(s) collected.",
-                submitted,
-                done,
-            )
+            if config.show_only:
+                logger.info(
+                    "%d qualifying cluster(s) shown as PROPOSED zones.",
+                    proposed_shown,
+                )
+            else:
+                logger.info(
+                    "%d zone(s) submitted for import, %d result(s) "
+                    "collected.",
+                    submitted,
+                    done,
+                )
 
             if import_failed:
                 # Retry new events after a genuine import failure.
@@ -362,12 +393,6 @@ def run_cycle(
 
     # ---- 6. Viewer ------------------------------------------------------
     if viewer is not None:
-        for cluster in clusters:
-            viewer.log_activity(
-                f"Clu X={cluster.center_x:.0f} Y={cluster.center_y:.0f} "
-                f"{cluster.event_count}evt {cluster.score:.0f}pt"
-            )
-
         for _, row in events.head(14).iterrows():
             viewer.add_event(row)
 
@@ -391,8 +416,45 @@ def run_cycle(
 
 
 def main() -> None:
-    config = Config()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="RACZoneGen — RAC Automatic Zone Monitor"
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Run against the built-in simulated database "
+        "(no MineStar / SQL Server required).",
+    )
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=-1,
+        metavar="N",
+        help="Run N polling cycles then exit (-1 = run forever). "
+        "Useful for headless / scripted validation.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Use an explicit config.ini instead of the auto-discovered one.",
+    )
+    args = parser.parse_args()
+
+    config = Config(args.config)
+
+    if args.config is not None:
+        logger.info(
+            "Explicit config file: %s",
+            Path(args.config).resolve(),
+        )
+
     setup_logging(config)
+
+    simulate = args.simulate or config.simulation_enabled
 
     logger.info("=" * 60)
     logger.info("RACZoneGen starting")
@@ -411,18 +473,41 @@ def main() -> None:
         config.default_speed_kmh,
     )
     logger.info(
-        "Automatic imports enabled=%s, dry_run=%s",
+        "Automatic imports enabled=%s, dry_run=%s, show_only=%s",
         config.import_enabled,
         config.dry_run,
+        config.show_only,
     )
+
+    if simulate:
+        logger.info(
+            "Data source: SIMULATED — RAC events are synthetic; lanes "
+            "and existing zones are read live from MineStar."
+        )
+    else:
+        logger.info("Data source: live MineStar SQL Server.")
+
+    if args.cycles > 0:
+        logger.info(
+            "Scripted run: executing %d polling cycle(s) and exiting.",
+            args.cycles,
+        )
 
     config.zone_output_directory.mkdir(parents=True, exist_ok=True)
     config.runtime_directory.mkdir(parents=True, exist_ok=True)
 
-    database = Database(
+    live_database = Database(
         config.odbc_connection_string,
         query_timeout=config.db_query_timeout,
     )
+
+    if simulate:
+        database: Database | SimulatedDatabase = SimulatedDatabase(
+            config,
+            live_database,
+        )
+    else:
+        database = live_database
 
     minestar = MineStar(config)
 
@@ -500,6 +585,15 @@ def main() -> None:
                 logger.exception(
                     "Polling cycle failed. No zones imported this cycle."
                 )
+
+            if args.cycles > 0:
+                args.cycles -= 1
+                if args.cycles <= 0:
+                    logger.info(
+                        "Scripted run complete after configured number "
+                        "of cycles."
+                    )
+                    break
 
             elapsed = time.monotonic() - cycle_started
             wait_seconds = max(

@@ -36,6 +36,7 @@ class ExistingZone:
     center_x: float
     center_y: float
     half_size: float  # half the bounding-box extent (metres)
+    proposed: bool = False  # display-only zone (show-only mode)
 
 
 def polygon_bounds(

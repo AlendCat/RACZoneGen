@@ -61,8 +61,12 @@ def find_config_file() -> tuple[Path, Path]:
 class Config:
     """Typed, validated access to every runtime setting."""
 
-    def __init__(self) -> None:
-        self.config_file, self.config_dir = find_config_file()
+    def __init__(self, config_file: Path | None = None) -> None:
+        if config_file is None:
+            self.config_file, self.config_dir = find_config_file()
+        else:
+            self.config_file = config_file.resolve()
+            self.config_dir = self.config_file.parent
 
         parser = configparser.ConfigParser(interpolation=None)
         parser.read(self.config_file, encoding="utf-8-sig")
@@ -157,11 +161,46 @@ class Config:
             "minestar", "import_enabled"
         )
         self.dry_run = parser.getboolean("minestar", "dry_run")
+        self.show_only = parser.getboolean(
+            "minestar", "show_only", fallback=False
+        )
         self.allow_outside_mine_boundary = parser.getboolean(
             "minestar", "allow_outside_mine_boundary"
         )
         self.import_workers = max(
             1, parser.getint("minestar", "import_workers", fallback=1)
+        )
+
+        # --- simulation ---------------------------------------------------
+        self.simulation_enabled = parser.getboolean(
+            "simulation", "enabled", fallback=False
+        )
+        self.simulation_seed = parser.getint(
+            "simulation", "random_seed", fallback=20260820
+        )
+        self.simulation_spawn_per_cycle = parser.getint(
+            "simulation", "spawn_per_cycle", fallback=2
+        )
+        self.simulation_jitter_metres = parser.getfloat(
+            "simulation", "jitter_metres", fallback=30.0
+        )
+        self.simulation_level_min = parser.getint(
+            "simulation", "level_min", fallback=1
+        )
+        self.simulation_level_max = parser.getint(
+            "simulation", "level_max", fallback=4
+        )
+        self.simulation_speed_min = parser.getfloat(
+            "simulation", "speed_min", fallback=30.0
+        )
+        self.simulation_speed_max = parser.getfloat(
+            "simulation", "speed_max", fallback=65.0
+        )
+        self.simulation_time_window_minutes = parser.getint(
+            "simulation", "time_window_minutes", fallback=120
+        )
+        self.simulation_hotspots = self._parse_hotspots(
+            "simulation", "hotspots"
         )
 
         # --- display -------------------------------------------------------
@@ -183,6 +222,45 @@ class Config:
             path = self.config_dir / path
 
         return path.resolve()
+
+    def _parse_hotspots(
+        self, section: str, option: str
+    ) -> list[tuple[float, float, float | None, float | None]]:
+        """Parse 'X,Y[,Level[,Speed]];...' hotspot definitions."""
+        raw = self._parser.get(section, option, fallback="")
+        result: list[
+            tuple[float, float, float | None, float | None]
+        ] = []
+
+        for item in raw.split(";"):
+            item = item.strip()
+            if not item:
+                continue
+
+            parts = [p.strip() for p in item.split(",")]
+
+            if len(parts) < 2:
+                continue
+
+            try:
+                x_value = float(parts[0])
+                y_value = float(parts[1])
+            except ValueError:
+                continue
+
+            try:
+                level = float(parts[2]) if len(parts) > 2 else None
+            except ValueError:
+                level = None
+
+            try:
+                speed = float(parts[3]) if len(parts) > 3 else None
+            except ValueError:
+                speed = None
+
+            result.append((x_value, y_value, level, speed))
+
+        return result
 
     def validate(self) -> None:
         if self.poll_interval_seconds < 1:
