@@ -252,6 +252,7 @@ def run_cycle(
             import_failed = False
             submitted = 0
             proposed_shown = 0
+            is_simulated = isinstance(database, SimulatedDatabase)
 
             for cluster in actionable_clusters:
                 if cluster_is_suppressed(
@@ -271,6 +272,45 @@ def run_cycle(
                     continue
 
                 speed_limit = minestar.compute_speed_limit(cluster)
+
+                if is_simulated:
+                    xml_file, zone_name = minestar.create_zone_xml(
+                        cluster, speed_limit
+                    )
+                    logger.info(
+                        "Generated zone %s at X=%.2f Y=%.2f. "
+                        "Events=%d, new=%d, score=%.2f, speed limit=%.1f "
+                        "km/h (avg %.1f km/h).",
+                        zone_name,
+                        cluster.center_x,
+                        cluster.center_y,
+                        cluster.event_count,
+                        cluster.new_event_count,
+                        cluster.score,
+                        speed_limit,
+                        (
+                            cluster.average_speed_kmh
+                            if cluster.average_speed_kmh
+                            else config.default_speed_kmh
+                        ),
+                    )
+                    logger.info(
+                        "Simulation mode: zone %s displayed as PROPOSED, "
+                        "no mstarrun import (file kept for review: %s).",
+                        zone_name,
+                        xml_file,
+                    )
+                    existing_zones.append(
+                        ExistingZone(
+                            name=zone_name,
+                            center_x=cluster.center_x,
+                            center_y=cluster.center_y,
+                            half_size=config.zone_size_metres / 2.0,
+                            proposed=True,
+                        )
+                    )
+                    proposed_shown += 1
+                    continue
 
                 xml_file, zone_name = minestar.create_zone_xml(
                     cluster, speed_limit
@@ -295,9 +335,6 @@ def run_cycle(
                 )
 
                 if config.show_only:
-                    # Show-only mode: never touch mstarrun.  The zone is
-                    # added to the in-memory library as a "proposed" zone
-                    # so the viewer draws it without creating anything.
                     logger.info(
                         "Show-only mode: zone %s displayed as PROPOSED, "
                         "no mstarrun import.",
@@ -360,7 +397,7 @@ def run_cycle(
                 elif status == "failed":
                     import_failed = True
 
-            if config.show_only:
+            if config.show_only or is_simulated:
                 logger.info(
                     "%d qualifying cluster(s) shown as PROPOSED zones.",
                     proposed_shown,

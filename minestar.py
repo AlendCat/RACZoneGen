@@ -5,7 +5,7 @@ Builds MineStar zone XML documents from a template, computes the
 speed limit from the average vehicle speed of the RAC cluster, and
 runs mstarrun.bat to export / import zones.
 
-Zone naming convention:  <name_prefix>_<timestamp>_<X>_<Y>
+Zone naming convention:  <name_prefix>_<timestamp>
 The prefix acts as a filter so exported zones can be grouped into an
 in-memory library on startup and used to suppress duplicates.
 """
@@ -245,12 +245,17 @@ class MineStar:
         now = datetime.now().astimezone()
         timestamp = now.isoformat(timespec="milliseconds")
 
-        zone_name = (
+        base_name = (
             f"{self.config.zone_name_prefix}_"
-            f"{now.strftime('%Y%m%d_%H%M%S')}_"
-            f"{cluster.center_x:.1f}_"
-            f"{cluster.center_y:.1f}"
+            f"{now.strftime('%Y%m%d_%H%M%S')}"
         )
+        zone_name = base_name
+        output_directory = self.config.zone_output_directory
+        output_directory.mkdir(parents=True, exist_ok=True)
+        counter = 1
+        while (output_directory / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', zone_name)}.xml").exists():
+            counter += 1
+            zone_name = f"{base_name}_{counter}"
 
         name_element = zone_element.find("name")
         polygon_element = zone_element.find("polygon")

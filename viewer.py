@@ -48,6 +48,13 @@ TEXT_PRIMARY = "#EAEAEA"
 TEXT_GREY = "#9AA0A6"
 
 
+def _compact_coord(value: float) -> str:
+    av = abs(value)
+    if av >= 1000:
+        return f"{value / 1000:.1f}K"
+    return f"{value:.1f}"
+
+
 class Viewer:
     """Live-updating site map with an event side table."""
 
@@ -127,7 +134,9 @@ class Viewer:
             self._severity_mappable,
             cax=self.figure.add_axes(placeholder["colorbar"]),
         )
-        self._colorbar.ax.set_title("RAC", color=TEXT_GREY, fontsize=8)
+        self._colorbar.ax.set_title("RAC", color=TEXT_GREY, fontsize=8, loc="left", pad=6)
+        self._colorbar.ax.yaxis.set_label_position("left")
+        self._colorbar.ax.yaxis.set_ticks_position("left")
         self._colorbar.ax.tick_params(
             colors=TEXT_GREY,
             labelsize=7,
@@ -135,14 +144,41 @@ class Viewer:
             right=False,
             labelleft=True,
             labelright=False,
+            pad=3,
         )
         self._colorbar.set_label(
-            "Level", color=TEXT_GREY, fontweight="bold"
+            "Level", color=TEXT_GREY, fontweight="bold", labelpad=8
         )
 
         self._legend = None
 
+        self._pan_active = False
+        self._pan_origin: tuple[float, float] | None = None
+        self._pan_xlim: tuple[float, float] | None = None
+        self._pan_ylim: tuple[float, float] | None = None
+        self._ctrl_down = False
+        self._hover_zones: list[ExistingZone] = []
+        self._zone_annotation = self.map_axis.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 10),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.35", fc="#1F2937", ec="#93C5FD", alpha=0.92),
+            color="#DBEAFE",
+            fontsize=7,
+            ha="left",
+            va="bottom",
+            visible=False,
+            zorder=12,
+        )
+
         self.figure.canvas.mpl_connect("close_event", self._on_close)
+        self.figure.canvas.mpl_connect("key_press_event", self._on_key_press)
+        self.figure.canvas.mpl_connect("key_release_event", self._on_key_release)
+        self.figure.canvas.mpl_connect("button_press_event", self._on_button_press)
+        self.figure.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.figure.canvas.mpl_connect("button_release_event", self._on_button_release)
+        self.figure.canvas.mpl_connect("scroll_event", self._on_scroll)
         self._closed = False
 
         plt.show(block=False)
@@ -162,6 +198,116 @@ class Viewer:
 
     def _on_close(self, _event) -> None:
         self._closed = True
+
+    def _on_key_press(self, event) -> None:
+        key = getattr(event, "key", None)
+        if key is not None and "control" in key.lower():
+            self._ctrl_down = True
+
+    def _on_key_release(self, event) -> None:
+        key = getattr(event, "key", None)
+        if key is not None and "control" in key.lower():
+            self._ctrl_down = False
+        elif key is None:
+            self._ctrl_down = False
+
+    def _on_button_press(self, event) -> None:
+        if event.inaxes is not self.map_axis:
+            return
+        if getattr(event, "button", None) != 1:
+            return
+        key = getattr(event, "key", None)
+        is_ctrl = self._ctrl_down or (key is not None and "control" in key.lower())
+        if not is_ctrl:
+            return
+        if getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+            return
+        self._pan_active = True
+        self._pan_origin = (event.x, event.y)
+        self._pan_xlim = self.map_axis.get_xlim()
+        self._pan_ylim = self.map_axis.get_ylim()
+
+    def _on_mouse_move(self, event) -> None:
+        if self._pan_active:
+            if getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+                return
+            if self._pan_origin is None or self._pan_xlim is None or self._pan_ylim is None:
+                return
+            bbox = self.map_axis.bbox
+            if bbox.width == 0 or bbox.height == 0:
+                return
+            dx_disp = event.x - self._pan_origin[0]
+            dy_disp = event.y - self._pan_origin[1]
+            x0, x1 = self._pan_xlim
+            y0, y1 = self._pan_ylim
+            x_range = x1 - x0
+            scale = x_range / bbox.width
+            dx_data = dx_disp * scale
+            dy_data = dy_disp * scale
+            self.map_axis.set_xlim(x0 - dx_data, x1 - dx_data)
+            self.map_axis.set_ylim(y0 - dy_data, y1 - dy_data)
+            self.figure.canvas.draw_idle()
+            return
+
+        if getattr(event, "inaxes", None) is not self.map_axis:
+            if self._zone_annotation.get_visible():
+                self._zone_annotation.set_visible(False)
+                self.figure.canvas.draw_idle()
+            return
+        xdata = getattr(event, "xdata", None)
+        ydata = getattr(event, "ydata", None)
+        if xdata is None or ydata is None:
+            if self._zone_annotation.get_visible():
+                self._zone_annotation.set_visible(False)
+                self.figure.canvas.draw_idle()
+            return
+        for zone in self._hover_zones:
+            half = max(zone.half_size, 50.0)
+            if abs(xdata - zone.center_x) <= half and abs(ydata - zone.center_y) <= half:
+                self._zone_annotation.xy = (zone.center_x, zone.center_y)
+                self._zone_annotation.set_text(zone.name)
+                if not self._zone_annotation.get_visible():
+                    self._zone_annotation.set_visible(True)
+                    self.figure.canvas.draw_idle()
+                return
+        if self._zone_annotation.get_visible():
+            self._zone_annotation.set_visible(False)
+            self.figure.canvas.draw_idle()
+
+    def _on_button_release(self, event) -> None:
+        if getattr(event, "button", None) != 1:
+            return
+        self._pan_active = False
+        self._pan_origin = None
+        self._pan_xlim = None
+        self._pan_ylim = None
+
+    def _on_scroll(self, event) -> None:
+        if getattr(event, "inaxes", None) is not self.map_axis:
+            return
+        key = getattr(event, "key", None)
+        is_ctrl = self._ctrl_down or (key is not None and "control" in key.lower())
+        if not is_ctrl:
+            return
+        if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
+            return
+        factor = 0.85 if event.button == "up" else 1.15
+        if event.step is not None:
+            try:
+                step = float(event.step)
+                factor = 0.85 ** step if step > 0 else 1.15 ** (-step)
+            except Exception:
+                pass
+        x0, x1 = self.map_axis.get_xlim()
+        y0, y1 = self.map_axis.get_ylim()
+        xdata, ydata = event.xdata, event.ydata
+        new_x0 = xdata - (xdata - x0) * factor
+        new_x1 = xdata + (x1 - xdata) * factor
+        new_y0 = ydata - (ydata - y0) * factor
+        new_y1 = ydata + (y1 - ydata) * factor
+        self.map_axis.set_xlim(new_x0, new_x1)
+        self.map_axis.set_ylim(new_y0, new_y1)
+        self.figure.canvas.draw_idle()
 
     def is_open(self) -> bool:
         if self._closed:
@@ -196,10 +342,10 @@ class Viewer:
         self.event_log.appendleft(
             (
                 time_text,
-                f"{row['X']:>8.1f}",
-                f"{row['Y']:>8.1f}",
-                f"{int(row['Level']):>2}",
-                f"{speed_text:>3}",
+                _compact_coord(float(row["X"])),
+                _compact_coord(float(row["Y"])),
+                f"{int(row['Level'])}",
+                speed_text,
             )
         )
 
@@ -335,6 +481,17 @@ class Viewer:
             handles.append(collection)
 
             self._colorbar.update_normal(collection)
+            self._colorbar.ax.yaxis.set_label_position("left")
+            self._colorbar.ax.yaxis.set_ticks_position("left")
+            self._colorbar.ax.tick_params(
+                colors=TEXT_GREY,
+                labelsize=7,
+                left=True,
+                right=False,
+                labelleft=True,
+                labelright=False,
+                pad=3,
+            )
 
         # Existing zones + suppression areas -------------------------------
         for zone in existing_zones:
@@ -346,94 +503,67 @@ class Viewer:
                     (zone.center_x - half, zone.center_y - half),
                     2 * half,
                     2 * half,
-                    facecolor="#1B873B",
-                    edgecolor="#3DFF6F",
-                    linestyle=(0, (5, 2)),
+                    facecolor="#2563EB",
+                    edgecolor="#93C5FD",
+                    linestyle="-",
                     linewidth=1.8,
-                    alpha=0.45,
+                    alpha=0.80,
                     zorder=4,
                 )
                 suppression_patch = Circle(
                     center,
                     suppression_radius,
                     fill=False,
-                    edgecolor="#3DFF6F",
-                    linestyle="--",
-                    linewidth=1.2,
-                    alpha=0.8,
+                    edgecolor="#60A5FA",
+                    linestyle=":",
+                    linewidth=1.4,
+                    alpha=0.85,
                     zorder=3,
-                )
-                name_text = axis.text(
-                    zone.center_x,
-                    zone.center_y - half - 1.0,
-                    f"{zone.name} (PROPOSED)",
-                    color="#9DFFB5",
-                    fontsize=6.5,
-                    horizontalalignment="center",
-                    zorder=6,
                 )
             else:
                 zone_patch = Rectangle(
                     (zone.center_x - half, zone.center_y - half),
                     2 * half,
                     2 * half,
-                    facecolor="#B024E0",
-                    edgecolor="white",
+                    facecolor="#2563EB",
+                    edgecolor="#93C5FD",
+                    linestyle="-",
                     linewidth=1.4,
-                    alpha=0.45,
+                    alpha=0.80,
                     zorder=4,
                 )
                 suppression_patch = Circle(
                     center,
                     suppression_radius,
                     fill=False,
-                    edgecolor="#E06AFF",
-                    linestyle="--",
-                    linewidth=1.2,
-                    alpha=0.8,
+                    edgecolor="#60A5FA",
+                    linestyle=":",
+                    linewidth=1.4,
+                    alpha=0.85,
                     zorder=3,
-                )
-                name_text = axis.text(
-                    zone.center_x,
-                    zone.center_y - half - 1.0,
-                    zone.name,
-                    color="#E7B4FF",
-                    fontsize=6.5,
-                    horizontalalignment="center",
-                    zorder=6,
                 )
 
             axis.add_patch(zone_patch)
             axis.add_patch(suppression_patch)
-            self._dynamic.extend(
-                [zone_patch, suppression_patch, name_text]
-            )
+            self._dynamic.extend([zone_patch, suppression_patch])
+
+        self._hover_zones = list(existing_zones)
 
         # Qualifying clusters ---------------------------------------------
         for cluster in clusters:
-            blocked = cluster_is_suppressed(
-                cluster, existing_zones, suppression_radius
+            avg_level = cluster.score / max(cluster.event_count, 1)
+            lvl = max(1.0, min(4.0, float(avg_level)))
+            x_rgba = self._severity_colormap(
+                self._severity_mappable.norm(lvl)
             )
 
-            color = "#6B7280" if blocked else "#35C9FF"
-
-            hub = Circle(
-                (cluster.search_x, cluster.search_y),
-                grouping_radius,
-                fill=False,
-                edgecolor=color,
-                linestyle=":",
-                linewidth=1.1,
-                alpha=0.65,
-                zorder=2,
-            )
             mark = axis.scatter(
                 [cluster.center_x],
                 [cluster.center_y],
                 marker="x",
-                color=color,
-                s=110,
-                linewidths=2.2,
+                color=x_rgba,
+                s=130,
+                linewidths=2.4,
                 zorder=6,
             )
             speed_text = (
@@ -452,8 +582,7 @@ class Viewer:
                 fontsize=7,
                 zorder=7,
             )
-            axis.add_patch(hub)
-            self._dynamic.extend([hub, mark, label])
+            self._dynamic.extend([mark, label])
 
         # Bounds: frozen once the site extent is known ----------------------
         if self._fixed_bounds is None:
@@ -480,14 +609,6 @@ class Viewer:
             fontweight="bold",
             loc="left",
         )
-
-        if handles:
-            self._legend = axis.legend(
-                handles=handles,
-                loc="upper right",
-                fontsize=8,
-                framealpha=0.5,
-            )
 
         self._draw_panel()
         self.figure.canvas.draw_idle()
@@ -524,14 +645,14 @@ class Viewer:
         pixel_ratio = span_x / span_y
         fraction_ratio = pixel_ratio / fig_aspect
 
-        left_gap = 0.05
-        right_gap = 0.05
+        left_gap = 0.065
+        right_gap = 0.04
         bottom_gap = 0.07
         top_gap = 0.06
         colorbar_w = 0.018
-        colorbar_gap = 0.011
-        table_w = 0.16
-        table_gap = 0.012
+        colorbar_gap = 0.014
+        table_w = 0.20
+        table_gap = 0.015
         colorbar_height = 0.78
 
         avail_w = 1.0 - left_gap - right_gap
@@ -640,8 +761,12 @@ class Viewer:
         """
         Draw the RAC event list as a compact data-entry style table.
 
-        Rows have a fixed height (no stretching when the list is short),
-        columns are evenly spaced, and the newest event sits on top.
+        Rows have a fixed height (no stretching when the list is short).
+        Column widths are proportional to content so TIME/X/Y get more
+        room and km/h no longer clips at the edge; values are centred
+        in their cells so neighbours never overlap.  The overall panel
+        geometry is kept identical before and after `_freeze_layout` so
+        the good initial gapage is preserved when data populates.
         """
         panel = self.panel_axis
         panel.clear()
@@ -654,15 +779,20 @@ class Viewer:
         bottom_margin = 0.02
         header_height = 0.06
         row_height = 0.05
-        left = 0.035
-        right = 0.965
-        fontsize = 9.5
+        left = 0.02
+        right = 0.98
+        fontsize = 9.0
+        header_fontsize = 9.0
 
+        weights = [0.22, 0.26, 0.26, 0.10, 0.16]
         columns = ["TIME", "X", "Y", "Lv", "km/h"]
-        step = (right - left) / len(columns)
-        column_x = [
-            left + step * (index + 0.5) for index in range(len(columns))
-        ]
+        usable = right - left
+        total_w = sum(weights)
+        norm = [w / total_w * usable for w in weights]
+        edges = [left]
+        for w in norm:
+            edges.append(edges[-1] + w)
+        centres = [(edges[i] + edges[i + 1]) / 2.0 for i in range(len(columns))]
 
         panel.add_patch(
             Rectangle(
@@ -671,22 +801,22 @@ class Viewer:
                 header_height,
                 facecolor="#1C2A24",
                 edgecolor="#35C759",
-                linewidth=1.0,
+                linewidth=1.2,
                 transform=panel.transAxes,
                 zorder=1,
+                clip_on=False,
             )
         )
-
-        for header_text, x in zip(columns, column_x):
+        for header_text, cx in zip(columns, centres):
             panel.text(
-                x,
+                cx,
                 top - header_height / 2.0,
                 header_text,
                 va="center",
-                ha="left",
+                ha="center",
                 transform=panel.transAxes,
                 color="#8CFFA8",
-                fontsize=fontsize,
+                fontsize=header_fontsize,
                 fontfamily="monospace",
                 fontweight="bold",
                 zorder=2,
@@ -696,8 +826,8 @@ class Viewer:
 
         if not rows:
             panel.text(
-                (left + right) / 2.0,
-                (top + bottom_margin) / 2.0,
+                0.5,
+                0.5,
                 "No RAC events since start",
                 va="center",
                 ha="center",
@@ -727,15 +857,27 @@ class Viewer:
                     )
                 )
 
-            for text, x in zip(values, column_x):
+            try:
+                lvl_val = int(float(values[3]))
+            except Exception:
+                lvl_val = 0
+            if lvl_val <= 2:
+                row_color = TEXT_PRIMARY
+            else:
+                lvl_c = max(1.0, min(4.0, float(lvl_val)))
+                row_color = self._severity_colormap(
+                    self._severity_mappable.norm(lvl_c)
+                )
+
+            for text, cx in zip(values, centres):
                 panel.text(
-                    x,
+                    cx,
                     row_top - row_height / 2.0,
                     text,
                     va="center",
-                    ha="left",
+                    ha="center",
                     transform=panel.transAxes,
-                    color=TEXT_PRIMARY,
+                    color=row_color,
                     fontsize=fontsize,
                     fontfamily="monospace",
                     zorder=2,
