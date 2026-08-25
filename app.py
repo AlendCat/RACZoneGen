@@ -293,7 +293,7 @@ def run_cycle(
             import_failed = False
             submitted = 0
             proposed_shown = 0
-            is_simulated = isinstance(database, SimulatedDatabase)
+            is_simulated = isinstance(database, SimulatedDatabase) and not getattr(config, "simulation_real_import", False)
 
             for cluster in actionable_clusters:
                 if cluster_is_suppressed(
@@ -404,6 +404,7 @@ def run_cycle(
                 future = executor.submit(minestar.import_zone, xml_file)
                 cluster._import_future = future  # type: ignore[attr-defined]
                 cluster._zone_name = zone_name  # type: ignore[attr-defined]
+                cluster._xml_file = xml_file  # type: ignore[attr-defined]
                 submitted += 1
 
             # Collect background import results (pumping the GUI while
@@ -448,14 +449,54 @@ def run_cycle(
                         cluster.search_y = new_zone.center_y
                     except Exception:
                         pass
+                elif status in ("dry_run", "disabled"):
+                    xml_file = getattr(cluster, "_xml_file", None)
+                    zone_name = getattr(cluster, "_zone_name", "unknown")
+                    logger.info(
+                        "%s for %s: %s (file kept for review)",
+                        status,
+                        zone_name,
+                        xml_file,
+                    )
+                    new_zone = ExistingZone(
+                        name=zone_name,
+                        center_x=cluster.center_x,
+                        center_y=cluster.center_y,
+                        half_size=config.zone_size_metres / 2.0,
+                        proposed=True,
+                    )
+                    existing_zones.append(new_zone)
+                    try:
+                        cluster.anchor_zone = new_zone
+                        cluster.center_x = new_zone.center_x
+                        cluster.center_y = new_zone.center_y
+                        cluster.search_x = new_zone.center_x
+                        cluster.search_y = new_zone.center_y
+                    except Exception:
+                        pass
+                    proposed_shown += 1
                 elif status == "failed":
                     import_failed = True
 
-            if config.show_only or is_simulated:
+            if is_simulated:
                 logger.info(
                     "%d qualifying cluster(s) shown as PROPOSED zones.",
                     proposed_shown,
                 )
+            elif config.show_only or proposed_shown > 0:
+                if submitted > 0:
+                    logger.info(
+                        "%d zone(s) submitted for import, %d result(s) "
+                        "collected (%d shown as PROPOSED dry_run/disabled).",
+                        submitted,
+                        done,
+                        proposed_shown,
+                    )
+                else:
+                    logger.info(
+                        "%d qualifying cluster(s) shown as PROPOSED zones (dry_run/disabled).",
+                        proposed_shown,
+                    )
             else:
                 logger.info(
                     "%d zone(s) submitted for import, %d result(s) "
@@ -484,8 +525,10 @@ def run_cycle(
 
     # ---- 6. Viewer ------------------------------------------------------
     if viewer is not None:
-        for _, row in events.head(14).iterrows():
-            viewer.add_event(row)
+        if "_IsNew" in events.columns:
+            new_rows = events[events["_IsNew"]].sort_values("Time", ascending=True)
+            for _, row in new_rows.iterrows():
+                viewer.add_event(row)
 
         viewer.update(
             events,
@@ -573,10 +616,17 @@ def main() -> None:
     )
 
     if simulate:
-        logger.info(
-            "Data source: SIMULATED — RAC events are synthetic; lanes "
-            "and existing zones are read live from MineStar."
-        )
+        if getattr(config, "simulation_real_import", False):
+            logger.info(
+                "Data source: SIMULATED — RAC events are synthetic; lanes "
+                "and existing zones are read live from MineStar. "
+                "real_import=true → zones will be REALLY imported via mstarrun."
+            )
+        else:
+            logger.info(
+                "Data source: SIMULATED — RAC events are synthetic; lanes "
+                "and existing zones are read live from MineStar."
+            )
     else:
         logger.info("Data source: live MineStar SQL Server.")
 

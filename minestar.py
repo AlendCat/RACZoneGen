@@ -112,6 +112,7 @@ class MineStar:
         RAC_AUTO zones does not block zone creation forever.
         """
         current_file = self.config.current_zones_file
+        current_file.parent.mkdir(parents=True, exist_ok=True)
 
         if current_file.exists():
             current_file.unlink()
@@ -120,8 +121,11 @@ class MineStar:
             [
                 "-b",
                 "exportZones",
+                "-all",
+                "-dir",
+                str(current_file.parent.resolve()),
                 "-file",
-                str(current_file),
+                current_file.name,
             ]
         )
 
@@ -217,27 +221,51 @@ class MineStar:
 
         return limit
 
+    def _template_zone(self) -> ET.Element:
+        template_file = getattr(self.config, "zone_template_file", None)
+        if template_file is not None:
+            try:
+                p = Path(template_file)
+                if p.is_file():
+                    root = ET.parse(p).getroot()
+                    tz = root.find("zone")
+                    if tz is not None:
+                        return copy.deepcopy(tz)
+            except Exception:
+                pass
+        return ET.fromstring(
+            '<zone>'
+            '<OID>0</OID><id>0</id><version>0</version><revision>1</revision>'
+            '<active>true</active><layerUpdateVersion>0</layerUpdateVersion>'
+            '<editable>true</editable><name>New Zone</name>'
+            '<polygon><point x="0" y="0" z="300"/><point x="0" y="0" z="300"/>'
+            '<point x="0" y="0" z="300"/><point x="0" y="0" z="300"/>'
+            '<point x="0" y="0" z="300"/></polygon>'
+            '<speedLimit magnitude="0.0" unit="kilometres per hour" unitType="speed"/>'
+            '<tractionLevel>100</tractionLevel>'
+            '<flags><bedDown>false</bedDown><level1EntryIncident>false</level1EntryIncident>'
+            '<level1ExitIncident>false</level1ExitIncident><beepIfOtherMachinesEnter>false</beepIfOtherMachinesEnter>'
+            '<beepIfOtherMachinesArePresent>false</beepIfOtherMachinesArePresent><silenceProximityAlarms>false</silenceProximityAlarms>'
+            '<silenceRadarAlarms>false</silenceRadarAlarms><mannedExclusionZone>false</mannedExclusionZone><cleanUp>false</cleanUp>'
+            '<canBeRemovedByPanel>false</canBeRemovedByPanel><autonomousInclusionZone>false</autonomousInclusionZone>'
+            '<autonomousExclusionZone>false</autonomousExclusionZone><multicastUpdateZone>false</multicastUpdateZone>'
+            '<passable>false</passable><outsideAOZ>false</outsideAOZ></flags>'
+            '<loadedSpeedLimit magnitude="0.0" unit="kilometres per hour" unitType="speed"/>'
+            '<automaticallyManaged>false</automaticallyManaged><barrier>false</barrier>'
+            '<displayColorRed>255</displayColorRed><displayColorBlue>255</displayColorBlue><displayColorGreen>255</displayColorGreen>'
+            '<displayColorAlpha>255</displayColorAlpha>'
+            '<createdDate>2026-01-01T00:00:00.000+00:00</createdDate>'
+            '<lastUpdatedDate>2026-01-01T00:00:00.000+00:00</lastUpdatedDate>'
+            '</zone>'
+        )
+
     def create_zone_xml(
         self,
         cluster: Cluster,
         speed_limit_kmh: float,
     ) -> tuple[Path, str]:
-        """Create a square MineStar zone XML from the exported template."""
-        template_file = self.config.zone_template_file
-
-        if not template_file.is_file():
-            raise FileNotFoundError(
-                f"Zone template not found: {template_file}"
-            )
-
-        source_root = ET.parse(template_file).getroot()
-        template_zone = source_root.find("zone")
-
-        if template_zone is None:
-            raise ValueError(
-                f"{template_file} does not contain a <zone>"
-            )
-
+        """Create a square MineStar zone XML (no external template required)."""
+        template_zone = self._template_zone()
         output_root = ET.Element("zones")
         zone_element = copy.deepcopy(template_zone)
         output_root.append(zone_element)
@@ -268,6 +296,11 @@ class MineStar:
 
         name_element.text = zone_name
 
+        for tag in ("OID", "id", "version", "revision", "layerUpdateVersion"):
+            elem = zone_element.find(tag)
+            if elem is not None:
+                elem.text = "0"
+
         created_element = zone_element.find("createdDate")
         updated_element = zone_element.find("lastUpdatedDate")
 
@@ -282,7 +315,7 @@ class MineStar:
 
         new_polygon = ET.Element("polygon")
         half_size = self.config.zone_size_metres / 2.0
-        elevation = self.config.zone_elevation
+        elevation = float(getattr(self.config, "zone_elevation", 300.0))
 
         corners = [
             (cluster.center_x - half_size, cluster.center_y - half_size),
@@ -347,17 +380,8 @@ class MineStar:
         Import one zone.
 
         Returns one of: imported / disabled / dry_run / failed.
+        Successful real imports delete the temp XML afterwards.
         """
-        command = [
-            "-b",
-            "importZones",
-            "-file",
-            str(xml_file.resolve()),
-        ]
-
-        if self.config.allow_outside_mine_boundary:
-            command.extend(["-AllowOutsideMineBoundary", "NO_VALIDATION"])
-
         if not self.config.import_enabled:
             logger.info(
                 "Import disabled. XML generated only: %s",
@@ -369,10 +393,25 @@ class MineStar:
             logger.info(
                 "Dry-run import command: %s",
                 subprocess.list2cmdline(
-                    [str(self.executable), *command]
+                    [str(self.executable), "-b", "importZones", "-file", str(xml_file.resolve())]
                 ),
             )
             return "dry_run"
+
+        import shutil
+        bin_dir = self.config.mstar_bin_directory
+        bin_target = bin_dir / "zones.xml"
+        try:
+            bin_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(xml_file, bin_target)
+        except Exception as copy_error:
+            logger.error("Failed to stage import file %s -> %s: %s", xml_file, bin_target, copy_error)
+            return "failed"
+
+        command = ["-b", "importZones"]
+
+        if self.config.allow_outside_mine_boundary:
+            command.extend(["-AllowOutsideMineBoundary", "NO_VALIDATION"])
 
         result = self._command(command)
 
@@ -392,7 +431,13 @@ class MineStar:
             "Successfully imported MineStar zone: %s",
             xml_file.name,
         )
-
+        try:
+            xml_file.unlink(missing_ok=True)
+            tmp = xml_file.with_suffix(".xml.tmp")
+            tmp.unlink(missing_ok=True)
+            bin_target.unlink(missing_ok=True)
+        except Exception:
+            pass
         return "imported"
 
 

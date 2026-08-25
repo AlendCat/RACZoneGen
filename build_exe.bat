@@ -17,7 +17,7 @@ if errorlevel 1 goto fail
 
 mkdir "dist\sql" 2>nul
 copy /Y "config.ini" "dist\config.ini"
-copy /Y "zones.xml" "dist\zones.xml"
+if exist "zones.xml" copy /Y "zones.xml" "dist\zones.xml"
 copy /Y "sql\rac_events.sql" "dist\sql\rac_events.sql"
 copy /Y "sql\lanes.sql" "dist\sql\lanes.sql"
 copy /Y "sql\zones.sql" "dist\sql\zones.sql"

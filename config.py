@@ -89,8 +89,30 @@ class Config:
             "database", "query_timeout_seconds", fallback=60
         )
 
-        # --- rac -----------------------------------------------------------
-        self.rac_query_file = self._path("rac", "query_file")
+        # --- sql (unified folder) + rac --------------------------------------
+        if parser.has_option("database", "sql_directory"):
+            self.sql_directory = self._path("database", "sql_directory")
+        elif parser.has_option("paths", "sql_directory"):
+            self.sql_directory = self._path("paths", "sql_directory")
+        else:
+            self.sql_directory = self.config_dir / "sql"
+            self.sql_directory = self.sql_directory.resolve()
+
+        if parser.has_option("rac", "query_file"):
+            self.rac_query_file = self._path("rac", "query_file")
+        else:
+            self.rac_query_file = (self.sql_directory / "rac_events.sql").resolve()
+
+        if parser.has_option("lanes", "query_file"):
+            self.lane_query_file = self._path("lanes", "query_file")
+        else:
+            self.lane_query_file = (self.sql_directory / "lanes.sql").resolve()
+
+        if parser.has_option("zone", "zones_query_file"):
+            self.zones_query_file = self._path("zone", "zones_query_file")
+        else:
+            self.zones_query_file = (self.sql_directory / "zones.sql").resolve()
+
         self.time_cutoff_minutes = parser.getint(
             "rac", "time_cutoff_minutes"
         )
@@ -107,28 +129,42 @@ class Config:
         )
 
         # --- lanes ---------------------------------------------------------
-        self.lane_query_file = self._path("lanes", "query_file")
         self.lane_refresh_interval_seconds = parser.getint(
-            "lanes", "refresh_interval_seconds", fallback=300
+            "lanes", "refresh_interval_seconds", fallback=21600
         )
 
         # --- zone ----------------------------------------------------------
-        self.zone_template_file = self._path("zone", "template_file")
         self.zone_output_directory = self._path("zone", "output_directory")
-        self.zone_name_prefix = parser.get(
-            "zone", "name_prefix"
-        ).strip()
         self.zone_size_metres = parser.getfloat(
             "zone", "zone_size_metres"
         )
-        self.zone_elevation = parser.getfloat("zone", "elevation")
         self.suppression_radius_metres = parser.getfloat(
             "zone", "suppression_radius_metres"
         )
-        self.zones_query_file = self._path("zone", "zones_query_file")
         self.zones_refresh_interval_seconds = parser.getint(
             "zone", "zones_refresh_interval_seconds", fallback=300
         )
+        self.zone_name_prefix = "RacMonitorGen_zone"
+        if parser.has_option("zone", "name_prefix"):
+            try:
+                v = parser.get("zone", "name_prefix").strip()
+                if v:
+                    self.zone_name_prefix = v
+            except Exception:
+                pass
+        self.zone_elevation = 300.0
+        if parser.has_option("zone", "elevation"):
+            try:
+                self.zone_elevation = parser.getfloat("zone", "elevation")
+            except Exception:
+                pass
+        if parser.has_option("zone", "template_file"):
+            try:
+                self.zone_template_file = self._path("zone", "template_file")
+            except Exception:
+                self.zone_template_file = self.config_dir / "zones.xml"
+        else:
+            self.zone_template_file = self.config_dir / "zones.xml"
 
         # --- speed limit ---------------------------------------------------
         self.default_speed_kmh = parser.getfloat(
@@ -174,6 +210,9 @@ class Config:
         # --- simulation ---------------------------------------------------
         self.simulation_enabled = parser.getboolean(
             "simulation", "enabled", fallback=False
+        )
+        self.simulation_real_import = parser.getboolean(
+            "simulation", "real_import", fallback=False
         )
         self.simulation_seed = parser.getint(
             "simulation", "random_seed", fallback=20260820

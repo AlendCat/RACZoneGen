@@ -128,7 +128,7 @@ class Viewer:
             ["#E4C45C", "#E8873C", "#E23B3B"],
         )
         self._severity_mappable = ScalarMappable(
-            norm=Normalize(1, 4),
+            norm=Normalize(1, 5),
             cmap=self._severity_colormap,
         )
         self._severity_mappable.set_array([])
@@ -136,6 +136,8 @@ class Viewer:
             self._severity_mappable,
             cax=self.figure.add_axes(placeholder["colorbar"]),
         )
+        self._colorbar.set_ticks([1, 2, 3, 4, 5])
+        self._colorbar.set_ticklabels(["1", "2", "3", "4", "5"])
         self._colorbar.ax.set_title("RAC", color=TEXT_GREY, fontsize=8, loc="left", pad=6)
         self._colorbar.ax.yaxis.set_label_position("left")
         self._colorbar.ax.yaxis.set_ticks_position("left")
@@ -392,11 +394,12 @@ class Viewer:
     # ------------------------------------------------------------------
 
     def add_event(self, row: pd.Series) -> None:
-        """Add a single RAC event row to the panel."""
+        """Add a single RAC event row to the panel (newest at top, oldest popped)."""
         time_text = pd.Timestamp(row["Time"]).strftime("%H:%M:%S")
         speed = row.get("Speed")
         speed_text = f"{float(speed):.0f}" if pd.notna(speed) else "-"
         was_at_top = self._panel_scroll == 0
+        before = len(self.event_log)
         self.event_log.appendleft(
             (
                 time_text,
@@ -406,8 +409,17 @@ class Viewer:
                 speed_text,
             )
         )
+        after = len(self.event_log)
+        grew = 1 if after > before else 0
+        if grew == 0:
+            grew = 1
         if was_at_top:
             self._panel_scroll = 0
+        else:
+            max_rows_est = 18
+            total = len(self.event_log)
+            max_offset = max(0, total - max_rows_est)
+            self._panel_scroll = min(self._panel_scroll + grew, max_offset)
 
     # ------------------------------------------------------------------
     # Lanes (cached)
@@ -519,17 +531,12 @@ class Viewer:
 
         # RAC events -----------------------------------------------------
         if not events.empty:
-            minimum_level = float(events["Level"].min())
-            maximum_level = float(events["Level"].max())
-            if minimum_level == maximum_level:
-                maximum_level = minimum_level + 1.0
-
             collection = axis.scatter(
                 events["X"],
                 events["Y"],
                 c=events["Level"],
                 cmap=self._severity_colormap,
-                norm=Normalize(minimum_level, maximum_level),
+                norm=Normalize(1, 5),
                 s=34,
                 edgecolors="black",
                 linewidths=0.4,
@@ -541,6 +548,11 @@ class Viewer:
             handles.append(collection)
 
             self._colorbar.update_normal(collection)
+            try:
+                self._colorbar.set_ticks([1, 2, 3, 4, 5])
+                self._colorbar.set_ticklabels(["1", "2", "3", "4", "5"])
+            except Exception:
+                pass
             self._colorbar.ax.yaxis.set_label_position("left")
             self._colorbar.ax.yaxis.set_ticks_position("left")
             self._colorbar.ax.tick_params(
@@ -612,7 +624,7 @@ class Viewer:
         # Qualifying clusters ---------------------------------------------
         for cluster in clusters:
             avg_level = cluster.score / max(cluster.event_count, 1)
-            lvl = max(1.0, min(4.0, float(avg_level)))
+            lvl = max(1.0, min(5.0, float(avg_level)))
             x_rgba = self._severity_colormap(
                 self._severity_mappable.norm(lvl)
             )
@@ -972,7 +984,7 @@ class Viewer:
             if lvl_val <= 2:
                 row_color = TEXT_PRIMARY
             else:
-                lvl_c = max(1.0, min(4.0, float(lvl_val)))
+                lvl_c = max(1.0, min(5.0, float(lvl_val)))
                 row_color = self._severity_colormap(
                     self._severity_mappable.norm(lvl_c)
                 )
