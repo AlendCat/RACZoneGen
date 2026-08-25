@@ -106,6 +106,7 @@ class Viewer:
         self.event_log: deque[tuple[str, str, str, str, str]] = deque(
             maxlen=100
         )
+        self._event_coords: deque[tuple[float, float]] = deque(maxlen=100)
         self._panel_scroll: int = 0
 
         # Cached lane collection.
@@ -216,10 +217,48 @@ class Viewer:
         elif key is None:
             self._ctrl_down = False
 
+    def _zoom_to_point(self, x: float, y: float, half_window: float = 400.0) -> None:
+        try:
+            self.map_axis.set_xlim(x - half_window, x + half_window)
+            self.map_axis.set_ylim(y - half_window, y + half_window)
+            self.figure.canvas.draw_idle()
+        except Exception:
+            pass
+
     def _on_button_press(self, event) -> None:
-        if event.inaxes is not self.map_axis:
-            return
         if getattr(event, "button", None) != 1:
+            return
+        in_panel = getattr(event, "inaxes", None) is self.panel_axis or self._point_in_panel(event)
+        if in_panel:
+            try:
+                y = getattr(event, "ydata", None)
+                if y is None:
+                    return
+                top = 0.98
+                header_height = 0.06
+                bottom_margin = 0.02
+                row_height = 0.05
+                if y > top - header_height or y < bottom_margin:
+                    return
+                visible_index = int((top - header_height - y) // row_height)
+                if visible_index < 0:
+                    return
+                max_rows = int((top - header_height - bottom_margin) // row_height)
+                total = len(self.event_log)
+                if total == 0:
+                    return
+                log_index = self._panel_scroll + visible_index
+                if log_index < 0 or log_index >= total:
+                    return
+                coords = list(self._event_coords)
+                if log_index >= len(coords):
+                    return
+                rx, ry = coords[log_index]
+                self._zoom_to_point(rx, ry)
+            except Exception:
+                pass
+            return
+        if event.inaxes is not self.map_axis:
             return
         key = getattr(event, "key", None)
         is_ctrl = self._ctrl_down or (key is not None and "control" in key.lower())
@@ -398,17 +437,20 @@ class Viewer:
         time_text = pd.Timestamp(row["Time"]).strftime("%H:%M:%S")
         speed = row.get("Speed")
         speed_text = f"{float(speed):.0f}" if pd.notna(speed) else "-"
+        raw_x = float(row["X"])
+        raw_y = float(row["Y"])
         was_at_top = self._panel_scroll == 0
         before = len(self.event_log)
         self.event_log.appendleft(
             (
                 time_text,
-                _compact_coord(float(row["X"])),
-                _compact_coord(float(row["Y"])),
+                _compact_coord(raw_x),
+                _compact_coord(raw_y),
                 f"{int(row['Level'])}",
                 speed_text,
             )
         )
+        self._event_coords.appendleft((raw_x, raw_y))
         after = len(self.event_log)
         grew = 1 if after > before else 0
         if grew == 0:
@@ -529,6 +571,62 @@ class Viewer:
 
         handles = []
 
+        # Existing zones + suppression areas -------------------------------
+        for zone in existing_zones:
+            center = (zone.center_x, zone.center_y)
+            half = max(zone.half_size, zone_size / 2.0)
+
+            if zone.proposed:
+                zone_patch = Rectangle(
+                    (zone.center_x - half, zone.center_y - half),
+                    2 * half,
+                    2 * half,
+                    facecolor="#2563EB",
+                    edgecolor="#93C5FD",
+                    linestyle="-",
+                    linewidth=1.8,
+                    alpha=0.80,
+                    zorder=2,
+                )
+                suppression_patch = Circle(
+                    center,
+                    suppression_radius,
+                    fill=False,
+                    edgecolor="#60A5FA",
+                    linestyle=":",
+                    linewidth=1.4,
+                    alpha=0.85,
+                    zorder=2,
+                )
+            else:
+                zone_patch = Rectangle(
+                    (zone.center_x - half, zone.center_y - half),
+                    2 * half,
+                    2 * half,
+                    facecolor="#2563EB",
+                    edgecolor="#93C5FD",
+                    linestyle="-",
+                    linewidth=1.4,
+                    alpha=0.80,
+                    zorder=2,
+                )
+                suppression_patch = Circle(
+                    center,
+                    suppression_radius,
+                    fill=False,
+                    edgecolor="#60A5FA",
+                    linestyle=":",
+                    linewidth=1.4,
+                    alpha=0.85,
+                    zorder=2,
+                )
+
+            axis.add_patch(zone_patch)
+            axis.add_patch(suppression_patch)
+            self._dynamic.extend([zone_patch, suppression_patch])
+
+        self._hover_zones = list(existing_zones)
+
         # RAC events -----------------------------------------------------
         if not events.empty:
             collection = axis.scatter(
@@ -541,7 +639,7 @@ class Viewer:
                 edgecolors="black",
                 linewidths=0.4,
                 alpha=0.95,
-                zorder=3,
+                zorder=5,
                 label="RAC events",
             )
             self._dynamic.append(collection)
@@ -564,62 +662,6 @@ class Viewer:
                 labelright=False,
                 pad=3,
             )
-
-        # Existing zones + suppression areas -------------------------------
-        for zone in existing_zones:
-            center = (zone.center_x, zone.center_y)
-            half = max(zone.half_size, zone_size / 2.0)
-
-            if zone.proposed:
-                zone_patch = Rectangle(
-                    (zone.center_x - half, zone.center_y - half),
-                    2 * half,
-                    2 * half,
-                    facecolor="#2563EB",
-                    edgecolor="#93C5FD",
-                    linestyle="-",
-                    linewidth=1.8,
-                    alpha=0.80,
-                    zorder=4,
-                )
-                suppression_patch = Circle(
-                    center,
-                    suppression_radius,
-                    fill=False,
-                    edgecolor="#60A5FA",
-                    linestyle=":",
-                    linewidth=1.4,
-                    alpha=0.85,
-                    zorder=3,
-                )
-            else:
-                zone_patch = Rectangle(
-                    (zone.center_x - half, zone.center_y - half),
-                    2 * half,
-                    2 * half,
-                    facecolor="#2563EB",
-                    edgecolor="#93C5FD",
-                    linestyle="-",
-                    linewidth=1.4,
-                    alpha=0.80,
-                    zorder=4,
-                )
-                suppression_patch = Circle(
-                    center,
-                    suppression_radius,
-                    fill=False,
-                    edgecolor="#60A5FA",
-                    linestyle=":",
-                    linewidth=1.4,
-                    alpha=0.85,
-                    zorder=3,
-                )
-
-            axis.add_patch(zone_patch)
-            axis.add_patch(suppression_patch)
-            self._dynamic.extend([zone_patch, suppression_patch])
-
-        self._hover_zones = list(existing_zones)
 
         # Qualifying clusters ---------------------------------------------
         for cluster in clusters:
