@@ -21,6 +21,7 @@ never freezes while a MineStar command or a DB query is running.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 
@@ -62,7 +63,7 @@ class Viewer:
         plt.ion()
 
         self.figure = plt.figure(
-            figsize=(15, 8.5),
+            figsize=(14.0, 8.5),
             facecolor=PALETE_BG,
         )
 
@@ -81,9 +82,9 @@ class Viewer:
         # hugging the map's right edge, all centred in the window —
         # the table never sits at the far right of the window.
         placeholder = {
-            "map": [0.09, 0.09, 0.60, 0.82],
-            "panel": [0.73, 0.09, 0.20, 0.82],
-            "colorbar": [0.065, 0.16, 0.013, 0.68],
+            "map": [0.11, 0.09, 0.48, 0.82],
+            "panel": [0.68, 0.09, 0.28, 0.82],
+            "colorbar": [0.065, 0.16, 0.018, 0.68],
         }
         self.map_axis = self.figure.add_axes(placeholder["map"])
         self.panel_axis = self.figure.add_axes(placeholder["panel"])
@@ -103,8 +104,9 @@ class Viewer:
             spine.set_linewidth(1.5)
 
         self.event_log: deque[tuple[str, str, str, str, str]] = deque(
-            maxlen=14
+            maxlen=100
         )
+        self._panel_scroll: int = 0
 
         # Cached lane collection.
         self._lane_collection: PatchCollection | None = None
@@ -179,6 +181,7 @@ class Viewer:
         self.figure.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.figure.canvas.mpl_connect("button_release_event", self._on_button_release)
         self.figure.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.figure.canvas.mpl_connect("resize_event", self._on_resize)
         self._closed = False
 
         plt.show(block=False)
@@ -282,7 +285,61 @@ class Viewer:
         self._pan_xlim = None
         self._pan_ylim = None
 
+    def _point_in_panel(self, event) -> bool:
+        try:
+            bbox = self.panel_axis.bbox
+            x, y = getattr(event, "x", None), getattr(event, "y", None)
+            if x is None or y is None:
+                return False
+            return bbox.x0 <= x <= bbox.x1 and bbox.y0 <= y <= bbox.y1
+        except Exception:
+            return False
+
     def _on_scroll(self, event) -> None:
+        in_panel = getattr(event, "inaxes", None) is self.panel_axis or self._point_in_panel(event)
+        if in_panel:
+            top = 0.98
+            header_height = 0.06
+            bottom_margin = 0.02
+            row_height = 0.05
+            max_rows = int((top - header_height - bottom_margin) // row_height)
+            total = len(self.event_log)
+            max_offset = max(0, total - max_rows)
+            if max_offset == 0:
+                return
+            step = 3
+            try:
+                if getattr(event, "step", None) is not None:
+                    step = max(1, int(abs(float(event.step))) * 3)
+            except Exception:
+                pass
+            btn = getattr(event, "button", None)
+            if btn == "up" or btn == 4:
+                self._panel_scroll = max(0, self._panel_scroll - step)
+            elif btn == "down" or btn == 5:
+                self._panel_scroll = min(max_offset, self._panel_scroll + step)
+            else:
+                step_val = getattr(event, "step", None)
+                if step_val is not None:
+                    try:
+                        s = float(step_val)
+                        if s > 0:
+                            self._panel_scroll = max(0, self._panel_scroll - step)
+                        elif s < 0:
+                            self._panel_scroll = min(max_offset, self._panel_scroll + step)
+                        else:
+                            return
+                    except Exception:
+                        return
+                else:
+                    return
+            self._draw_panel()
+            self.figure.canvas.draw_idle()
+            try:
+                self.figure.canvas.flush_events()
+            except Exception:
+                pass
+            return
         if getattr(event, "inaxes", None) is not self.map_axis:
             return
         key = getattr(event, "key", None)
@@ -339,6 +396,7 @@ class Viewer:
         time_text = pd.Timestamp(row["Time"]).strftime("%H:%M:%S")
         speed = row.get("Speed")
         speed_text = f"{float(speed):.0f}" if pd.notna(speed) else "-"
+        was_at_top = self._panel_scroll == 0
         self.event_log.appendleft(
             (
                 time_text,
@@ -348,6 +406,8 @@ class Viewer:
                 speed_text,
             )
         )
+        if was_at_top:
+            self._panel_scroll = 0
 
     # ------------------------------------------------------------------
     # Lanes (cached)
@@ -557,9 +617,15 @@ class Viewer:
                 self._severity_mappable.norm(lvl)
             )
 
+            anchor = getattr(cluster, "anchor_zone", None)
+            if anchor is not None:
+                draw_x, draw_y = anchor.center_x, anchor.center_y
+            else:
+                draw_x, draw_y = cluster.center_x, cluster.center_y
+
             mark = axis.scatter(
-                [cluster.center_x],
-                [cluster.center_y],
+                [draw_x],
+                [draw_y],
                 marker="x",
                 color=x_rgba,
                 s=130,
@@ -572,8 +638,8 @@ class Viewer:
                 else "-"
             )
             label = axis.text(
-                cluster.center_x,
-                cluster.center_y,
+                draw_x,
+                draw_y,
                 (
                     f" {cluster.event_count} evt"
                     f", spd {speed_text}"
@@ -603,6 +669,7 @@ class Viewer:
             (
                 f"RAC events: {len(events)}"
                 f"  |  Zones: {len(existing_zones)}"
+                f"  |  Clusters: {len(clusters)}"
             ),
             color=TEXT_PRIMARY,
             fontsize=12,
@@ -618,82 +685,89 @@ class Viewer:
     # Map bounds (frozen)
     # ------------------------------------------------------------------
 
-    def _freeze_layout(
+    def _apply_three_section_layout(
         self, bounds: tuple[float, float, float, float]
     ) -> None:
-        """
-        Size the map from the site's data ratio and lay the severity bar
-        and RAC table tight against its edges.
-
-        The whole block is centred in the window, so the table hugs the
-        map instead of sitting at the far right of the window.  Runs
-        once, the first cycle that has a site extent.
-        """
         min_x, max_x, min_y, max_y = bounds
         span_x = max_x - min_x
         span_y = max_y - min_y
         if span_x <= 0 or span_y <= 0:
             return
 
-        # Desired map display ratio (width/height in pixels) for equal
-        # unit scaling.  Converted to figure-fraction ratio using the
-        # figure's own aspect so the axes box fills the allocated rect
-        # exactly (otherwise matplotlib shrinks it and the table no
-        # longer hugs the map).
         fig_w, fig_h = self.figure.get_size_inches()
         fig_aspect = fig_w / fig_h
         pixel_ratio = span_x / span_y
         fraction_ratio = pixel_ratio / fig_aspect
 
-        left_gap = 0.065
-        right_gap = 0.04
-        bottom_gap = 0.07
+        left_spacer = 0.04
+        right_spacer = 0.04
+        bottom_gap = 0.06
         top_gap = 0.06
         colorbar_w = 0.018
-        colorbar_gap = 0.014
-        table_w = 0.20
-        table_gap = 0.015
+        colorbar_gap = 0.012
+        gap_between = 0.04
+        table_quadrant_w = 0.28
+        table_w = table_quadrant_w
         colorbar_height = 0.78
 
-        avail_w = 1.0 - left_gap - right_gap
         avail_h = 1.0 - bottom_gap - top_gap
-        usable_w = avail_w - (
-            colorbar_w + colorbar_gap + table_gap + table_w
-        )
+        avail_w = 1.0 - left_spacer - right_spacer
+        map_group_avail_w = avail_w - gap_between - table_quadrant_w
+        usable_map_w = map_group_avail_w - colorbar_w - colorbar_gap
 
-        if avail_h * fraction_ratio <= usable_w:
+        if avail_h * fraction_ratio <= usable_map_w:
             map_h = avail_h
             map_w = map_h * fraction_ratio
-            block_h = map_h
-            block_w = colorbar_w + colorbar_gap + map_w + table_gap + table_w
-            block_x = left_gap + (avail_w - block_w) / 2.0
-            block_y = bottom_gap
         else:
-            map_w = usable_w
+            map_w = usable_map_w
             map_h = map_w / fraction_ratio
-            block_h = map_h
-            block_w = avail_w
-            block_x = left_gap
-            block_y = bottom_gap + (avail_h - block_h) / 2.0
 
-        colorbar_x = block_x
-        colorbar_side_margin = block_h * (1.0 - colorbar_height) / 2.0
-        colorbar_y = block_y + colorbar_side_margin
-        colorbar_h = block_h * colorbar_height
+        map_group_w = colorbar_w + colorbar_gap + map_w
+        map_group_x = left_spacer + (map_group_avail_w - map_group_w) / 2.0
+        map_group_y = bottom_gap + (avail_h - map_h) / 2.0
+
+        colorbar_x = map_group_x
+        colorbar_h = map_h * colorbar_height
+        colorbar_y = map_group_y + (map_h - colorbar_h) / 2.0
 
         map_x = colorbar_x + colorbar_w + colorbar_gap
-        map_y = block_y
+        map_y = map_group_y
 
-        table_x = map_x + map_w + table_gap
-        table_w = block_w - (table_x - block_x)
+        table_quadrant_x = left_spacer + map_group_avail_w + gap_between
+        table_x = table_quadrant_x + (table_quadrant_w - table_w) / 2.0
+        table_y = bottom_gap + (avail_h - map_h) / 2.0
 
         self._colorbar.ax.set_position(
             [colorbar_x, colorbar_y, colorbar_w, colorbar_h]
         )
         self.map_axis.set_position([map_x, map_y, map_w, map_h])
-        self.panel_axis.set_position([table_x, block_y, table_w, map_h])
+        self.panel_axis.set_position([table_x, table_y, table_w, map_h])
 
         self.map_axis.set_box_aspect(span_y / span_x)
+
+    def _on_resize(self, event) -> None:
+        if self._bounds_home is not None:
+            try:
+                self._apply_three_section_layout(self._bounds_home)
+                self.figure.canvas.draw_idle()
+            except Exception:
+                pass
+
+    def _freeze_layout(
+        self, bounds: tuple[float, float, float, float]
+    ) -> None:
+        """
+        Three-section horizontal flow — left spacer | Map Group | Table Quadrant.
+
+        * Left spacer pushes everything toward the center.
+        * Map Group (heat indicator + haul-road map) is one locked unit,
+          sized from the site's data ratio and centered-left.
+        * Table Quadrant on the right is its own area; the table panel is
+          centered both vertically and horizontally inside that quadrant
+          so it looks balanced against the map, not stuck at the top-left.
+        Runs once, the first cycle that has a site extent.
+        """
+        self._apply_three_section_layout(bounds)
         self._bounds_home = bounds
         self._set_view(bounds)
 
@@ -794,6 +868,59 @@ class Viewer:
             edges.append(edges[-1] + w)
         centres = [(edges[i] + edges[i + 1]) / 2.0 for i in range(len(columns))]
 
+        rows = list(self.event_log)
+
+        if not rows:
+            panel.add_patch(
+                Rectangle(
+                    (0.0, top - header_height),
+                    1.0,
+                    header_height,
+                    facecolor="#1C2A24",
+                    edgecolor="#35C759",
+                    linewidth=1.2,
+                    transform=panel.transAxes,
+                    zorder=1,
+                    clip_on=False,
+                )
+            )
+            for header_text, cx in zip(columns, centres):
+                panel.text(
+                    cx,
+                    top - header_height / 2.0,
+                    header_text,
+                    va="center",
+                    ha="center",
+                    transform=panel.transAxes,
+                    color="#8CFFA8",
+                    fontsize=header_fontsize,
+                    fontfamily="monospace",
+                    fontweight="bold",
+                    zorder=2,
+                )
+            panel.text(
+                0.5,
+                0.5,
+                "No RAC events since start",
+                va="center",
+                ha="center",
+                transform=panel.transAxes,
+                color=TEXT_GREY,
+                fontsize=10,
+            )
+            return
+
+        max_rows = int(
+            (top - header_height - bottom_margin) // row_height
+        )
+        total = len(rows)
+        max_offset = max(0, total - max_rows)
+        if self._panel_scroll > max_offset:
+            self._panel_scroll = max_offset
+        if self._panel_scroll < 0:
+            self._panel_scroll = 0
+        visible = rows[self._panel_scroll : self._panel_scroll + max_rows] if total else []
+
         panel.add_patch(
             Rectangle(
                 (0.0, top - header_height),
@@ -822,26 +949,7 @@ class Viewer:
                 zorder=2,
             )
 
-        rows = list(self.event_log)
-
-        if not rows:
-            panel.text(
-                0.5,
-                0.5,
-                "No RAC events since start",
-                va="center",
-                ha="center",
-                transform=panel.transAxes,
-                color=TEXT_GREY,
-                fontsize=10,
-            )
-            return
-
-        max_rows = int(
-            (top - header_height - bottom_margin) // row_height
-        )
-
-        for index, values in enumerate(rows[:max_rows]):
+        for index, values in enumerate(visible):
             row_top = top - header_height - index * row_height
 
             if index % 2 == 0:
@@ -882,6 +990,40 @@ class Viewer:
                     fontfamily="monospace",
                     zorder=2,
                 )
+
+        if total > max_rows:
+            track_x = 0.985
+            track_w = 0.012
+            track_y0 = bottom_margin
+            track_h = top - header_height - bottom_margin
+            panel.add_patch(
+                Rectangle(
+                    (track_x, track_y0),
+                    track_w,
+                    track_h,
+                    facecolor="#2A2E33",
+                    edgecolor="#3A444E",
+                    linewidth=0.6,
+                    transform=panel.transAxes,
+                    zorder=5,
+                )
+            )
+            thumb_h = max(0.04, track_h * (max_rows / total))
+            if max_offset > 0:
+                thumb_y0 = track_y0 + track_h - thumb_h - (self._panel_scroll / max_offset) * (track_h - thumb_h)
+            else:
+                thumb_y0 = track_y0 + track_h - thumb_h
+            panel.add_patch(
+                Rectangle(
+                    (track_x, thumb_y0),
+                    track_w,
+                    thumb_h,
+                    facecolor="#5A6573",
+                    edgecolor="none",
+                    transform=panel.transAxes,
+                    zorder=6,
+                )
+            )
 
 
 def wait_for_next_cycle(

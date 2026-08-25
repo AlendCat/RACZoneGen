@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 import pandas as pd
@@ -38,10 +39,30 @@ class Cluster:
     new_event_count: int
     average_speed_kmh: float | None = None
     member_speeds: list[float] = field(default_factory=list)
+    member_sigs: set = field(default_factory=set)
+    anchor_zone: object | None = None
 
     @property
     def is_new(self) -> bool:
         """True when at least one member event is new this cycle."""
+        return self.new_event_count > 0
+
+
+@dataclass
+class PersistentCluster:
+    center_x: float
+    center_y: float
+    search_x: float
+    search_y: float
+    member_sigs: set
+    anchor_zone: object | None
+    score: float
+    event_count: int
+    new_event_count: int = 0
+    average_speed_kmh: float | None = None
+
+    @property
+    def is_new(self) -> bool:
         return self.new_event_count > 0
 
 
@@ -168,6 +189,8 @@ def find_clusters(
         dtype=float,
     )
 
+    working_sigs = event_signatures(working)
+
     assigned = np.zeros(len(working), dtype=bool)
     clusters: list[Cluster] = []
 
@@ -181,7 +204,7 @@ def find_clusters(
         )
 
         member_indices = np.flatnonzero(
-            (~assigned) & (distances < radius)
+            (~assigned) & (distances <= radius)
         )
 
         if len(member_indices) < minimum_events:
@@ -204,6 +227,7 @@ def find_clusters(
             if np.isfinite(s) and s > 0
         ]
 
+        member_sigs = {working_sigs[i] for i in member_indices}
         clusters.append(
             Cluster(
                 center_x=float(x_values[member_indices].mean()),
@@ -218,9 +242,156 @@ def find_clusters(
                     if member_speeds else None
                 ),
                 member_speeds=member_speeds,
+                member_sigs=member_sigs,
+                anchor_zone=None,
             )
         )
 
     clusters.sort(key=lambda c: c.score, reverse=True)
 
     return clusters[:top_n]
+
+
+def update_persistent_clusters(
+    events: pd.DataFrame,
+    persistent: list,
+    used_sigs: set,
+    existing_zones,
+    radius: float,
+    min_events: int,
+    score_threshold: float,
+    threshold_inclusive: bool,
+) -> list:
+    if events.empty:
+        return persistent
+    for pc in persistent:
+        pc.new_event_count = 0
+    sigs = event_signatures(events)
+    sig_to_idx = {s: i for i, s in enumerate(sigs)}
+    sig_to_row = {s: events.iloc[i] for i, s in enumerate(sigs)}
+    new_sigs = {s for s, f in zip(sigs, events["_IsNew"]) if f}
+
+    for pc in persistent:
+        if pc.anchor_zone is not None:
+            for ns in list(new_sigs):
+                if ns in used_sigs or ns in pc.member_sigs:
+                    continue
+                row = sig_to_row.get(ns)
+                if row is None:
+                    continue
+                d = math.hypot(float(row["X"]) - pc.center_x, float(row["Y"]) - pc.center_y)
+                if d <= radius:
+                    pc.member_sigs.add(ns)
+                    used_sigs.add(ns)
+                    pc.new_event_count += 1
+                    pc.event_count = len(pc.member_sigs)
+                    levels = []
+                    speeds = []
+                    for ms in pc.member_sigs:
+                        r = sig_to_row.get(ms)
+                        if r is not None:
+                            try:
+                                levels.append(float(r["Level"]))
+                            except Exception:
+                                pass
+                            sv = _speed_value(r)
+                            if sv is not None:
+                                speeds.append(sv)
+                    pc.score = float(sum(levels)) if levels else 0.0
+                    if speeds:
+                        pc.average_speed_kmh = float(sum(speeds) / len(speeds))
+        else:
+            for ns in list(new_sigs):
+                if ns in used_sigs or ns in pc.member_sigs:
+                    continue
+                row = sig_to_row.get(ns)
+                if row is None:
+                    continue
+                d = math.hypot(float(row["X"]) - pc.center_x, float(row["Y"]) - pc.center_y)
+                if d <= radius:
+                    pc.member_sigs.add(ns)
+                    used_sigs.add(ns)
+                    pc.new_event_count += 1
+                    xs = []
+                    ys = []
+                    levels = []
+                    speeds = []
+                    for ms in pc.member_sigs:
+                        r = sig_to_row.get(ms)
+                        if r is None:
+                            continue
+                        try:
+                            xs.append(float(r["X"]))
+                            ys.append(float(r["Y"]))
+                            levels.append(float(r["Level"]))
+                        except Exception:
+                            pass
+                        sv = _speed_value(r)
+                        if sv is not None:
+                            speeds.append(sv)
+                    if xs and ys:
+                        pc.center_x = float(sum(xs) / len(xs))
+                        pc.center_y = float(sum(ys) / len(ys))
+                        pc.search_x = pc.center_x
+                        pc.search_y = pc.center_y
+                    pc.event_count = len(pc.member_sigs)
+                    pc.score = float(sum(levels)) if levels else 0.0
+                    if speeds:
+                        pc.average_speed_kmh = float(sum(speeds) / len(speeds))
+
+    remaining_rows = []
+    for s in sigs:
+        if s in used_sigs:
+            continue
+        in_any = False
+        for pc in persistent:
+            if s in pc.member_sigs:
+                in_any = True
+                break
+        if in_any:
+            continue
+        remaining_rows.append(sig_to_idx[s])
+
+    if not remaining_rows:
+        return persistent
+
+    sub = events.iloc[remaining_rows].copy().reset_index(drop=True)
+    new_clusters = find_clusters(
+        sub,
+        radius=radius,
+        minimum_events=min_events,
+        score_threshold=score_threshold,
+        threshold_inclusive=threshold_inclusive,
+        top_n=10,
+    )
+    for c in new_clusters:
+        found = False
+        for pc in persistent:
+            if pc.anchor_zone is None and math.hypot(c.center_x - pc.center_x, c.center_y - pc.center_y) <= radius:
+                found = True
+                break
+        if found:
+            continue
+        is_suppressed = False
+        for z in existing_zones:
+            if math.hypot(c.center_x - z.center_x, c.center_y - z.center_y) <= 300:
+                is_suppressed = True
+                break
+        member_sigs = set(getattr(c, "member_sigs", set()))
+        for s in member_sigs:
+            used_sigs.add(s)
+        pc = PersistentCluster(
+            center_x=c.center_x,
+            center_y=c.center_y,
+            search_x=c.search_x,
+            search_y=c.search_y,
+            member_sigs=set(member_sigs),
+            anchor_zone=None,
+            score=c.score,
+            event_count=c.event_count,
+            new_event_count=c.new_event_count,
+            average_speed_kmh=c.average_speed_kmh,
+        )
+        persistent.append(pc)
+
+    return persistent

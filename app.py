@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from clustering import find_clusters, mark_new_events
+from clustering import find_clusters, mark_new_events, PersistentCluster, update_persistent_clusters
 from config import Config
 from database import Database
 from minestar import (
@@ -153,7 +153,9 @@ def run_cycle(
     last_lanes: pd.DataFrame,
     last_lane_refresh: float,
     last_zone_refresh: float,
-) -> tuple[Counter | None, list, pd.DataFrame, float, float]:
+    persistent_clusters: list | None = None,
+    used_sigs: set | None = None,
+) -> tuple[Counter | None, list, pd.DataFrame, float, float, list, set]:
     """One full polling cycle. Returns updated state."""
 
     # ---- 1. RAC query must succeed for the cycle to continue -----------
@@ -213,6 +215,23 @@ def run_cycle(
     else:
         zones_are_current = True
 
+    if persistent_clusters is None:
+        persistent_clusters = []
+    if used_sigs is None:
+        used_sigs = set()
+
+    persistent_clusters = update_persistent_clusters(
+        events,
+        persistent_clusters,
+        used_sigs,
+        existing_zones,
+        radius=config.grouping_radius_metres,
+        min_events=config.minimum_event_count,
+        score_threshold=config.grouping_score,
+        threshold_inclusive=config.threshold_inclusive,
+    )
+    clusters = persistent_clusters
+
     # ---- 4. New events → clusters → zones → background import ----------
     commit_event_sample = True
 
@@ -230,9 +249,31 @@ def run_cycle(
     elif new_event_count == 0:
         logger.info("No new RAC events since the previous poll. No action.")
     else:
-        actionable_clusters = [
-            cluster for cluster in clusters if cluster.is_new
-        ]
+        from clustering import event_signatures
+        new_sigs_this_cycle = set()
+        if "_IsNew" in events.columns:
+            sigs_all = event_signatures(events)
+            for s, f in zip(sigs_all, events["_IsNew"]):
+                if f:
+                    new_sigs_this_cycle.add(s)
+        actionable_clusters = []
+        for pc in persistent_clusters:
+            if pc.anchor_zone is not None:
+                continue
+            if pc.event_count < config.minimum_event_count:
+                continue
+            if config.threshold_inclusive:
+                if pc.score < config.grouping_score:
+                    continue
+            else:
+                if pc.score <= config.grouping_score:
+                    continue
+            has_new = any(s in new_sigs_this_cycle for s in pc.member_sigs)
+            if not has_new:
+                continue
+            if cluster_is_suppressed(pc, existing_zones, config.suppression_radius_metres):
+                continue
+            actionable_clusters.append(pc)
 
         if not actionable_clusters:
             logger.info(
@@ -300,15 +341,19 @@ def run_cycle(
                         zone_name,
                         xml_file,
                     )
-                    existing_zones.append(
-                        ExistingZone(
-                            name=zone_name,
-                            center_x=cluster.center_x,
-                            center_y=cluster.center_y,
-                            half_size=config.zone_size_metres / 2.0,
-                            proposed=True,
-                        )
+                    new_zone = ExistingZone(
+                        name=zone_name,
+                        center_x=cluster.center_x,
+                        center_y=cluster.center_y,
+                        half_size=config.zone_size_metres / 2.0,
+                        proposed=True,
                     )
+                    existing_zones.append(new_zone)
+                    cluster.anchor_zone = new_zone
+                    cluster.center_x = new_zone.center_x
+                    cluster.center_y = new_zone.center_y
+                    cluster.search_x = new_zone.center_x
+                    cluster.search_y = new_zone.center_y
                     proposed_shown += 1
                     continue
 
@@ -340,15 +385,19 @@ def run_cycle(
                         "no mstarrun import.",
                         zone_name,
                     )
-                    existing_zones.append(
-                        ExistingZone(
-                            name=zone_name,
-                            center_x=cluster.center_x,
-                            center_y=cluster.center_y,
-                            half_size=config.zone_size_metres / 2.0,
-                            proposed=True,
-                        )
+                    new_zone = ExistingZone(
+                        name=zone_name,
+                        center_x=cluster.center_x,
+                        center_y=cluster.center_y,
+                        half_size=config.zone_size_metres / 2.0,
+                        proposed=True,
                     )
+                    existing_zones.append(new_zone)
+                    cluster.anchor_zone = new_zone
+                    cluster.center_x = new_zone.center_x
+                    cluster.center_y = new_zone.center_y
+                    cluster.search_x = new_zone.center_x
+                    cluster.search_y = new_zone.center_y
                     proposed_shown += 1
                     continue
 
@@ -382,18 +431,23 @@ def run_cycle(
                     continue
 
                 if status == "imported":
-                    # Prevent another cluster in this same cycle from
-                    # creating a nearby zone.
-                    existing_zones.append(
-                        ExistingZone(
-                            name=getattr(
-                                cluster, "_zone_name", "unknown"
-                            ),
-                            center_x=cluster.center_x,
-                            center_y=cluster.center_y,
-                            half_size=config.zone_size_metres / 2.0,
-                        )
+                    new_zone = ExistingZone(
+                        name=getattr(
+                            cluster, "_zone_name", "unknown"
+                        ),
+                        center_x=cluster.center_x,
+                        center_y=cluster.center_y,
+                        half_size=config.zone_size_metres / 2.0,
                     )
+                    existing_zones.append(new_zone)
+                    try:
+                        cluster.anchor_zone = new_zone
+                        cluster.center_x = new_zone.center_x
+                        cluster.center_y = new_zone.center_y
+                        cluster.search_x = new_zone.center_x
+                        cluster.search_y = new_zone.center_y
+                    except Exception:
+                        pass
                 elif status == "failed":
                     import_failed = True
 
@@ -449,6 +503,8 @@ def run_cycle(
         last_lanes,
         last_lane_refresh,
         last_zone_refresh,
+        persistent_clusters,
+        used_sigs,
     )
 
 
@@ -557,6 +613,8 @@ def main() -> None:
 
     previous_event_counts: Counter | None = None
     existing_zones: list = []
+    persistent_clusters: list = []
+    used_sigs: set = set()
 
     last_lanes = pd.DataFrame(
         columns=["LANE_OID", "Segment", "POINT_NR", "X", "Y"]
@@ -604,6 +662,8 @@ def main() -> None:
                     last_lanes,
                     last_lane_refresh,
                     last_zone_refresh,
+                    persistent_clusters,
+                    used_sigs,
                 ) = run_cycle(
                     config,
                     database,
@@ -615,6 +675,8 @@ def main() -> None:
                     last_lanes,
                     last_lane_refresh,
                     last_zone_refresh,
+                    persistent_clusters,
+                    used_sigs,
                 )
             except KeyboardInterrupt:
                 raise
