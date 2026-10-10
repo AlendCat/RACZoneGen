@@ -9,15 +9,17 @@ python -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --onefile ^
-    --console ^
+    --windowed ^
     --name RACZoneGen ^
     --collect-all matplotlib ^
+    --collect-all pyodbc ^
+    --collect-all sqlalchemy ^
+    --hidden-import pyodbc ^
+    --hidden-import sqlalchemy ^
     app.py
 if errorlevel 1 goto fail
 
 mkdir "dist\sql" 2>nul
-copy /Y "config.ini" "dist\config.ini"
-if exist "zones.xml" copy /Y "zones.xml" "dist\zones.xml"
 copy /Y "sql\rac_events.sql" "dist\sql\rac_events.sql"
 copy /Y "sql\lanes.sql" "dist\sql\lanes.sql"
 copy /Y "sql\zones.sql" "dist\sql\zones.sql"

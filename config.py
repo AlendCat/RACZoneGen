@@ -17,17 +17,92 @@ def application_directory() -> Path:
 
 def default_public_directory() -> Path:
     public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public"))
-    return public_root / PUBLIC_APP_FOLDER
+    return public_root / "Documents" / PUBLIC_APP_FOLDER
+
+
+def _create_public_base_config() -> Path | None:
+    import shutil
+    public_dir = default_public_directory()
+    public_config = public_dir / DEFAULT_CONFIG_NAME
+    if public_config.is_file():
+        return public_config
+    try:
+        public_dir.mkdir(parents=True, exist_ok=True)
+        template = application_directory() / DEFAULT_CONFIG_NAME
+        if template.is_file():
+            shutil.copy2(template, public_config)
+        else:
+            public_config.write_text(
+                application_directory().joinpath(DEFAULT_CONFIG_NAME).read_text(encoding="utf-8-sig")
+                if (application_directory() / DEFAULT_CONFIG_NAME).exists()
+                else DEFAULT_CONFIG_TEXT,
+                encoding="utf-8",
+            )
+        sql_src = application_directory() / "sql"
+        sql_dst = public_dir / "sql"
+        if sql_src.is_dir() and not sql_dst.is_dir():
+            shutil.copytree(sql_src, sql_dst, dirs_exist_ok=True)
+        zones_src = application_directory() / "zones.xml"
+        zones_dst = public_dir / "zones.xml"
+        if zones_src.is_file() and not zones_dst.is_file():
+            shutil.copy2(zones_src, zones_dst)
+        return public_config if public_config.is_file() else None
+    except Exception:
+        return None
+
+
+DEFAULT_CONFIG_TEXT = """[application]
+poll_interval_seconds = 8
+[database]
+server = C001749812\\MINESTAR
+database = mshist
+sql_directory = sql
+[rac]
+grouping_radius_metres = 50
+grouping_score = 8
+minimum_event_count = 5
+[zone]
+output_directory = output
+zone_size_metres = 100
+suppression_radius_metres = 300
+zones_refresh_interval_seconds = 5
+[lanes]
+refresh_interval_seconds = 21600
+[minestar]
+mstarrun_location = D:\\mstar\\mstarHome\\bus\\bin\\mstarrun.bat
+[simulation]
+enabled = false
+import_enabled = false
+random_seed = 20260824
+spawn_per_cycle = 1
+jitter_metres = 500
+level_min = 0
+level_max = 5
+speed_min = 1
+speed_max = 60
+time_window_minutes = 120
+hotspots = 100.0,100.0;340.0,180.0;620.0,420.0
+"""
 
 
 def find_config_file() -> tuple[Path, Path]:
-    candidates = [
-        application_directory() / DEFAULT_CONFIG_NAME,
-        default_public_directory() / DEFAULT_CONFIG_NAME,
-    ]
+    is_frozen = getattr(sys, "frozen", False)
+    if is_frozen:
+        candidates = [
+            default_public_directory() / DEFAULT_CONFIG_NAME,
+            application_directory() / DEFAULT_CONFIG_NAME,
+        ]
+    else:
+        candidates = [
+            application_directory() / DEFAULT_CONFIG_NAME,
+            default_public_directory() / DEFAULT_CONFIG_NAME,
+        ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate, candidate.parent
+    created = _create_public_base_config()
+    if created is not None and created.is_file():
+        return created, created.parent
     searched = ", ".join(str(c) for c in candidates)
     raise FileNotFoundError("Configuration file not found. Looked in: " + searched)
 
