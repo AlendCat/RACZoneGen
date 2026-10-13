@@ -57,6 +57,9 @@ poll_interval_seconds = 8
 server = C001749812\\MINESTAR
 database = mshist
 sql_directory = sql
+use_windows_authentication = true
+username =
+password =
 [rac]
 grouping_radius_metres = 50
 grouping_score = 8
@@ -121,7 +124,31 @@ class Config:
         self.log_level = "INFO"
         server = parser.get("database", "server").strip()
         database = parser.get("database", "database").strip()
-        self.odbc_connection_string = f"Driver={{SQL Server}};Server={server};Database={database};Trusted_Connection=yes;"
+        self.use_windows_authentication = parser.getboolean(
+            "database", "use_windows_authentication", fallback=True
+        )
+        raw_username = parser.get("database", "username", fallback="").strip()
+        raw_password = parser.get("database", "password", fallback="").strip()
+        # Allow %ENV_VAR% expansion so passwords need not live in cleartext
+        # in config.ini (e.g. password = %RAC_DB_PASSWORD%).
+        self.db_username = os.path.expandvars(raw_username)
+        self.db_password = os.path.expandvars(raw_password)
+        if self.use_windows_authentication:
+            self.odbc_connection_string = (
+                f"Driver={{SQL Server}};Server={server};"
+                f"Database={database};Trusted_Connection=yes;"
+            )
+        else:
+            if not self.db_username or not self.db_password:
+                raise ValueError(
+                    "database username/password must be set when "
+                    "use_windows_authentication = false"
+                )
+            self.odbc_connection_string = (
+                f"Driver={{SQL Server}};Server={server};"
+                f"Database={database};"
+                f"UID={self.db_username};PWD={self._escape_odbc_value(self.db_password)};"
+            )
         self.db_query_timeout = 60
         if parser.has_option("database", "sql_directory"):
             self.sql_directory = self._path("database", "sql_directory")
@@ -183,6 +210,14 @@ class Config:
         self.log_directory = self.config_dir / "logs"
         self.runtime_directory = self.config_dir / "runtime"
         self.validate()
+
+    @staticmethod
+    def _escape_odbc_value(value: str) -> str:
+        # ODBC connection-string escaping: wrap in {} if the value contains
+        # a semicolon or braces; a literal } is escaped as }}.
+        if any(char in value for char in (";", "{", "}")):
+            return "{" + value.replace("}", "}}") + "}"
+        return value
 
     def _path(self, section: str, option: str) -> Path:
         configured_value = self._parser.get(section, option).strip()
