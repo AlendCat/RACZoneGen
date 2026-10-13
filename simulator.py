@@ -58,11 +58,20 @@ class SimulatedDatabase:
         self._events: list[dict] = []
         self._read_count = 0
 
-        self._site_bounds = self._resolve_site_bounds()
+        # Lazy: site bounds resolve on first spawn, NOT in __init__,
+        # so startup does one lane read (in main) instead of two.
+        self._site_bounds: tuple[float, float, float, float] | None = None
+        self._bounds_resolved = False
 
     # ------------------------------------------------------------------
     # Site extent (so synthetic events fall inside the drawn map)
     # ------------------------------------------------------------------
+
+    def _ensure_site_bounds(self) -> None:
+        if self._bounds_resolved:
+            return
+        self._bounds_resolved = True
+        self._site_bounds = self._resolve_site_bounds()
 
     def _resolve_site_bounds(
         self,
@@ -147,6 +156,7 @@ class SimulatedDatabase:
         self._read_count += 1
 
         if self._read_count > 1:
+            self._ensure_site_bounds()
             self._spawn_batch()
 
         self._prune(time_cutoff_minutes)

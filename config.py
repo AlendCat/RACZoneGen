@@ -174,7 +174,24 @@ class Config:
         self.default_speed_kmh = 40
         self.speed_offset_kmh = 10.0
         self.minimum_speed_kmh = 5.0
-        self.maximum_speed_kmh = 999.0
+        self.maximum_speed_kmh = 60.0
+        # Optional [speed] overrides (all have safe fallbacks so old
+        # config.ini files without a [speed] section keep working).
+        try:
+            if parser.has_option("speed", "payload_speed_divisor"):
+                self.payload_speed_divisor = parser.getfloat("speed", "payload_speed_divisor")
+            else:
+                self.payload_speed_divisor = 0.0
+            if parser.has_option("speed", "speed_offset_kmh"):
+                self.speed_offset_kmh = parser.getfloat("speed", "speed_offset_kmh")
+            if parser.has_option("speed", "minimum_speed_kmh"):
+                self.minimum_speed_kmh = parser.getfloat("speed", "minimum_speed_kmh")
+            if parser.has_option("speed", "maximum_speed_kmh"):
+                self.maximum_speed_kmh = parser.getfloat("speed", "maximum_speed_kmh")
+            if parser.has_option("speed", "default_speed_kmh"):
+                self.default_speed_kmh = parser.getfloat("speed", "default_speed_kmh")
+        except Exception:
+            pass
         if parser.has_option("minestar", "mstarrun_location"):
             val = parser.get("minestar", "mstarrun_location").strip()
             p = Path(os.path.expandvars(val))

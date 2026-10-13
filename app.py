@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from clustering import find_clusters, mark_new_events, PersistentCluster, update_persistent_clusters
+from clustering import mark_new_events, update_persistent_clusters
 from config import Config
 from database import Database
 from minestar import (
@@ -143,14 +143,6 @@ def run_cycle(
         previous_event_counts,
     )
     first_sample = previous_event_counts is None
-    clusters = find_clusters(
-        events,
-        radius=config.grouping_radius_metres,
-        minimum_events=config.minimum_event_count,
-        score_threshold=config.grouping_score,
-        threshold_inclusive=True,
-        top_n=1000,
-    )
 
     # ---- 2. Lanes (throttled; failure is non-fatal) ---------------------
     now = time.monotonic()
@@ -202,7 +194,7 @@ def run_cycle(
         score_threshold=config.grouping_score,
         threshold_inclusive=True,
     )
-    clusters = persistent_clusters
+    clusters: list = persistent_clusters
 
     # ---- 4. New events → clusters → zones → background import ----------
     commit_event_sample = True
@@ -442,7 +434,7 @@ def run_cycle(
 
     # ---- 6. Viewer ------------------------------------------------------
     if viewer is not None:
-        if "_IsNew" in events.columns:
+        if "_IsNew" in events.columns and not events.empty and "Time" in events.columns:
             new_rows = events[events["_IsNew"]].sort_values("Time", ascending=True)
             for _, row in new_rows.iterrows():
                 viewer.add_event(row)
@@ -509,7 +501,13 @@ def main() -> None:
     logger.info("Config file: %s", config.config_file)
     logger.info("Polling interval: %d s", config.poll_interval_seconds)
     logger.info("Zone size: %.0f m | suppression: %.0f m", config.zone_size_metres, config.suppression_radius_metres)
-    logger.info("Speed: avg-10 floor 5 (no max, no default)")
+    logger.info(
+        "Speed: avg-%.0f floor %.0f max %.0f (divisor %s)",
+        config.speed_offset_kmh,
+        config.minimum_speed_kmh,
+        config.maximum_speed_kmh,
+        config.payload_speed_divisor,
+    )
     if simulate:
         logger.info("Data source: SIMULATED (synthetic RAC, live lanes/zones) import_enabled=%s", getattr(config, "simulation_import_enabled", False))
     else:
@@ -525,13 +523,18 @@ def main() -> None:
     config.runtime_directory.mkdir(parents=True, exist_ok=True)
 
     live_database = Database(config.odbc_connection_string, query_timeout=60)
+    try:
+        live_database.speed_divisor = float(getattr(config, "payload_speed_divisor", 0.0) or 0.0)
+    except Exception:
+        live_database.speed_divisor = 0.0
     if simulate:
         database: Database | SimulatedDatabase = SimulatedDatabase(config, live_database)
     else:
         database = live_database
     minestar = MineStar(config)
     viewer = Viewer()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mstar-import")
+    viewer.pump(0.1)  # first paint (loading state) before any DB blocks
+    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mstar")
 
     previous_event_counts: Counter | None = None
     existing_zones: list = []
@@ -544,11 +547,16 @@ def main() -> None:
     last_lane_refresh = 0.0
     last_zone_refresh = 0.0
 
-    # ---- Startup: pull lanes + build in-memory zone library -------------
+    # ---- Startup: pull lanes + zone library IN PARALLEL -----------------
+    # Both queries run concurrently on the 2-worker pool while the viewer
+    # keeps pumping, so the window paints instantly instead of hanging.
+    lane_future = executor.submit(database.read_lanes, config.lane_query_file)
+    zone_future = executor.submit(
+        database.read_existing_zones,
+        config.zones_query_file,
+        config.zone_name_prefix,
+    )
     try:
-        lane_future = executor.submit(
-            database.read_lanes, config.lane_query_file
-        )
         last_lanes = wait_with_viewer(
             lane_future, viewer, timeout=config.db_query_timeout * 2
         )
@@ -556,11 +564,13 @@ def main() -> None:
         logger.info("Initial lane load complete.")
     except Exception:
         logger.exception("Initial lane load failed. The map will be empty.")
+        try:
+            lane_future.cancel()
+        except Exception:
+            pass
 
     try:
-        existing_zones = _read_zones(
-            database, minestar, config, viewer, executor
-        )
+        existing_zones = wait_with_viewer(zone_future, viewer, timeout=60)
         last_zone_refresh = time.monotonic()
         logger.info(
             "In-memory zone library: %d existing %s* zone(s).",
@@ -572,6 +582,10 @@ def main() -> None:
             "Initial MineStar zone library could not be built. "
             "Zone creation will be blocked until zones refresh."
         )
+        try:
+            zone_future.cancel()
+        except Exception:
+            pass
 
     try:
         while True:

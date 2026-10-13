@@ -21,9 +21,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'scipy', 'sklearn', 'IPython', 'notebook'],
     noarchive=False,
-    optimize=0,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 
@@ -32,12 +32,12 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,
-    [],
+    [('O', None, 'OPTION'), ('O', None, 'OPTION')],
     name='RACZoneGen',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

@@ -1,0 +1,2 @@
+python -m pip install -r requirements.txt
+python -m py_compile app.py viewer.py database.py clustering.py minestar.py simulator.py config.py

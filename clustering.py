@@ -77,15 +77,19 @@ def event_signatures(
     """
     signatures: list[tuple[int, float, float, float]] = []
 
-    for _, row in events.iterrows():
-        timestamp = pd.Timestamp(row["Time"])
+    times = pd.to_datetime(events["Time"], errors="coerce")
+    time_vals = times.astype("int64").to_numpy()
+    x_vals = pd.to_numeric(events["X"], errors="coerce").to_numpy(dtype=float)
+    y_vals = pd.to_numeric(events["Y"], errors="coerce").to_numpy(dtype=float)
+    l_vals = pd.to_numeric(events["Level"], errors="coerce").to_numpy(dtype=float)
 
+    for t, x, y, lv in zip(time_vals, x_vals, y_vals, l_vals):
         signatures.append(
             (
-                int(timestamp.value),
-                round(float(row["X"]), 3),
-                round(float(row["Y"]), 3),
-                round(float(row["Level"]), 3),
+                int(t),
+                round(float(x), 3),
+                round(float(y), 3),
+                round(float(lv), 3),
             )
         )
 
@@ -108,7 +112,7 @@ def mark_new_events(
     current_counts = Counter(signatures)
 
     if previous_counts is None:
-        events["_IsNew"] = False
+        events["_IsNew"] = pd.Series(False, index=events.index, dtype=bool)
         return events, current_counts, 0
 
     remaining_new: Counter = Counter()
@@ -127,27 +131,36 @@ def mark_new_events(
         else:
             new_flags.append(False)
 
-    events["_IsNew"] = new_flags
+    events["_IsNew"] = pd.Series(new_flags, index=events.index, dtype=bool)
 
     return events, current_counts, int(sum(new_flags))
 
 
 def _speed_value(row: pd.Series) -> float | None:
-    """Best-effort speed extraction from a RAC event row."""
+    """Best-effort speed extraction from a RAC event row (already km/h)."""
     speed = row.get("Speed")
 
     if speed is None:
         return None
 
     try:
-        value = float(pd.to_numeric(speed, errors="coerce"))
+        value = float(speed)
     except (TypeError, ValueError):
         return None
 
-    if not np.isfinite(value) or value < 0:
+    if not np.isfinite(value) or value <= 0 or value > 200:
         return None
 
     return value
+
+
+def _speed_array(frame: pd.DataFrame) -> np.ndarray:
+    """Vectorized speed column -> float array (NaN where missing)."""
+    if "Speed" not in frame.columns:
+        return np.full(len(frame), np.nan, dtype=float)
+    vals = pd.to_numeric(frame["Speed"], errors="coerce").to_numpy(dtype=float)
+    vals[(vals <= 0) | (vals > 200) | (~np.isfinite(vals))] = np.nan
+    return vals
 
 
 def find_clusters(
@@ -184,10 +197,7 @@ def find_clusters(
     else:
         new_flags = np.zeros(len(working), dtype=bool)
 
-    speeds = np.asarray(
-        [_speed_value(row) or np.nan for _, row in working.iterrows()],
-        dtype=float,
-    )
+    speeds = _speed_array(working)
 
     working_sigs = event_signatures(working)
 

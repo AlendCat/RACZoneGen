@@ -11,9 +11,12 @@ created, it groups nearby events into severity clusters (the hub-radius
 algorithm inherited from Kyle's prototype), and when a cluster qualifies it
 builds a 100 m x 100 m square MineStar zone whose speed limit equals the
 average vehicle speed of the RAC events minus a configurable offset
-(default 10 km/h, floored at 5 km/h). The zone is imported into MineStar on
-a **background thread** via `mstarrun.bat importZones`, so the live map
-never blocks on MineStar I/O.
+(default 10 km/h, clamped to `[minimum_speed_kmh, maximum_speed_kmh]`,
+default 5–60 km/h). Payloads above 200 km/h are treated as a wrong unit
+(auto-scaled by powers of ten, or divided by `[speed]
+payload_speed_divisor`) and never become zones. The zone is imported into
+MineStar on a **background thread** via `mstarrun.bat importZones`, so the
+live map never blocks on MineStar I/O.
 
 Key behavior guarantees:
 * **Only events that happen after program start create zones.** The first
@@ -84,14 +87,19 @@ Key settings (`config.ini`):
 9. **Sample-commit semantics** — the snapshot commits as the next baseline
    *unless* the zone export failed or a real import failed, in which case
    it is withheld so those new events get retried next cycle.
-10. **Viewer** — live map: lanes drawn as a *cached* PatchCollection (only
-    rebuilt when lane data changes), RAC events coloured by severity, square
-    zones + dashed suppression circles, cluster hubs, and a side data-entry
-    table listing the RAC events since start (time + X/Y + level + speed).
-    The severity legend sits on the **left** of the map and the map view is
-    **frozen** to a fixed extent once the site footprint is known. Zones
-    with `proposed=True` render green with a dashed edge and a "PROPOSED"
-    label; imported zones render magenta.
+10. **Viewer** — live map with **fixed geometry**: the map box, legend and
+    side table are set once and never re-fitted, so resizing the window
+    scales everything proportionally with no jumps. The map keeps equal
+    units (`aspect='equal', adjustable='datalim'`, box fixed, data padded)
+    and the view is frozen from the lane footprint on first data (user
+    pan/zoom is never stomped). Lanes draw as a *cached, decimated*
+    PatchCollection (rebuilt only when lane data changes; ~10 ms cached
+    repaints), RAC events coloured by severity, square zones (magenta =
+    imported, blue + PROPOSED tag = proposed) + thin suppression rings,
+    cluster hubs, and a side data-entry
+    table listing the RAC events since start (time + X/Y + level + speed,
+    speeds normalized to km/h). Draws are throttled (200 ms min interval)
+    and hover/resize handlers debounced so dragging never freezes.
 
 ## Zone naming
 
@@ -145,11 +153,19 @@ headless/service use.
 
 ## Issues & constraints
 
-* **Payload speed parsing is best-effort.** `database._payload_speed`
+* **Payload speed parsing is best-effort + unit-safe.** `database._to_kmh`
   tries JSON keys (`Speed`, `VehicleSpeed`, …), a bare float, or a
-  `speed=` text match; anything unparseable falls back to
-  `default_speed_kmh`. Confirm the actual `HEALTH_EVENT.PAYLOAD` shape on
-  the test site and adjust the key list if speeds look wrong.
+  `speed=` text match, then auto-scales by powers of ten until ≤ 200 km/h
+  (or divides by `[speed] payload_speed_divisor` when set). Anything still
+  absurd is dropped, and `compute_speed_limit` refuses averages > 200 km/h
+  and clamps to `[minimum, maximum]` — a garbage payload can never write a
+  218190 km/h zone. Confirm the actual `HEALTH_EVENT.PAYLOAD` unit on each
+  site and set the divisor explicitly.
+* Startup loads lanes + zones **in parallel** (2-worker pool) with the
+  window painted first; simulation resolves site bounds lazily so lanes are
+  read once, not twice.
+* Clustering runs **once per cycle** (persistent path only); speed arrays
+  and event signatures are vectorized, not `iterrows()`.
 * **Cluster seeds are X-descending** (deterministic but coordinate-
   dependent); changing the sort order changes cluster membership.
 * `find_clusters` is O(n²) distance work per seed — fine for typical RAC

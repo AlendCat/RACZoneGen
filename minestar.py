@@ -56,9 +56,24 @@ class MineStar:
         if average is None or average <= 0 or not math.isfinite(average):
             logger.warning("No parseable speed for cluster at %.1f,%.1f (avg %s) — skipping zone", cluster.center_x, cluster.center_y, average)
             return None
-        limit = average - 10.0
-        if limit < 5.0:
-            limit = 5.0
+        # Safety: refuse garbage payloads instead of writing a 218190 km/h
+        # zone into MineStar.  Anything above 200 km/h is a wrong unit,
+        # not a speeding truck (normalization should already have fixed it).
+        if average > 200:
+            logger.warning(
+                "Absurd avg speed %.1f km/h at %.1f,%.1f — skipping zone "
+                "(check [speed] payload_speed_divisor for this site)",
+                average, cluster.center_x, cluster.center_y,
+            )
+            return None
+        offset = float(getattr(self.config, "speed_offset_kmh", 10.0))
+        minimum = float(getattr(self.config, "minimum_speed_kmh", 5.0))
+        maximum = float(getattr(self.config, "maximum_speed_kmh", 60.0))
+        limit = average - offset
+        if limit < minimum:
+            limit = minimum
+        if limit > maximum:
+            limit = maximum
         return limit
 
     def _template_zone(self) -> ET.Element:

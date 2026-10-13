@@ -66,12 +66,24 @@ def normalize_columns(
 
 def _payload_speed(payload: object) -> float | None:
     """
-    Attempt to pull a speed (km/h) out of a RAC event payload.
+    Attempt to pull a speed (km/h, normalized) out of a RAC event payload.
 
     MineStar stores the payload for health events in several shapes:
-    JSON, a naive float string, or "speed=<value>" style text.  This
-    tries each in turn.
+    JSON, a naive float string, or "speed=<value>" style text.
+
+    Live sites have been observed returning raw values like 218200 for a
+    ~22 km/h truck — i.e. the payload is NOT in km/h (likely mm/min or a
+    x10000 fixed-point).  To stay safe this normalizes by powers of ten
+    until the value is sane for a mine vehicle, and clamps downstream.
+    An explicit divisor can be set via ``[speed] payload_speed_divisor``;
+    when 0 (default) this auto-scale applies.
     """
+    raw = _raw_payload_value(payload)
+    return _to_kmh(raw, divisor=0.0)
+
+
+def _raw_payload_value(payload: object) -> float | None:
+    """Extract the raw numeric payload without any unit conversion."""
     if payload is None:
         return None
 
@@ -123,6 +135,38 @@ def _payload_speed(payload: object) -> float | None:
     return None
 
 
+#: Above this (km/h) a raw payload is assumed to be in the wrong unit and
+#: scaled down by powers of ten.  200 km/h never happens on a mine site
+#: (haul trucks ~30-60, light vehicles <120), so anything above it is
+#: garbage in the wrong unit, not a speeding truck.
+_SANE_SPEED_KMH = 200.0
+
+
+def _to_kmh(raw: float | None, divisor: float = 0.0) -> float | None:
+    """Normalize a raw payload number to km/h."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value) or value <= 0:
+        return None
+    if divisor and divisor > 0:
+        value = value / float(divisor)
+        return value if np.isfinite(value) and value > 0 else None
+    # Auto-scale: divide by 10 until sane (max 6 steps = /1_000_000).
+    # 218200 -> 21820 -> 2182 -> 218.2 -> 21.82 (stops, sane).
+    # Normal 5-120 km/h values pass through untouched.
+    for _ in range(6):
+        if value <= _SANE_SPEED_KMH:
+            break
+        value /= 10.0
+    if not np.isfinite(value) or value <= 0 or value > _SANE_SPEED_KMH:
+        return None
+    return value
+
+
 class Database:
     """Wraps one SQLAlchemy engine with typed query helpers."""
 
@@ -140,6 +184,9 @@ class Database:
                 "timeout": query_timeout,
             },
         )
+        # Explicit payload->km/h divisor (0 = auto-scale by powers of ten).
+        # Set from [speed] payload_speed_divisor in app.py after construction.
+        self.speed_divisor: float = 0.0
 
     def dispose(self) -> None:
         self.engine.dispose()
@@ -175,11 +222,28 @@ class Database:
                 errors="coerce",
             )
 
-        events["Speed"] = events["Payload"].map(_payload_speed)
+        events["Speed"] = events["Payload"].map(
+            lambda v: _to_kmh(_raw_payload_value(v), self.speed_divisor)
+        )
 
         events = events.dropna(
             subset=["Time", "X", "Y", "Level"]
         ).copy()
+
+        # Diagnostic: if every speed came back None the payload shape is
+        # unknown — log a few raw samples once so the site can be fixed
+        # via [speed] payload_speed_divisor instead of silently skipping.
+        try:
+            if len(events) and events["Speed"].notna().sum() == 0:
+                sample = events["Payload"].head(3).tolist()
+                logger.warning(
+                    "No parseable speeds in %d event(s); raw payload sample: %r. "
+                    "Check [speed] payload_speed_divisor for this site.",
+                    len(events),
+                    sample,
+                )
+        except Exception:
+            pass
 
         events = events.reset_index(drop=True)
 

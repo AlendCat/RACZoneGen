@@ -1,21 +1,16 @@
-"""
-Live site map and event panel.
+"""Live site map and event panel.
 
-A responsive interactive matplotlib window:
+Fast, fixed-geometry matplotlib window:
 
-* autonomous lane network drawn as a *cached* PatchCollection so the
-  repaint per cycle is cheap even with ~4800 lanes / ~74k points
-* RAC events (only those reported since program start) scattered by
-  severity, with a colour scale legend on the *left* of the map
-* existing / newly placed square zones and their dashed suppression areas
-* qualifying clusters (dotted hub radius, X marks the centroid)
-* a compact, data-entry style side table listing the RAC events
-  (time / X / Y / level / speed)
-
-The map view is frozen to a fixed extent once the site footprint is
-known, so it keeps the same size and shape on every cycle.  The GUI
-event loop is pumped inside every blocking wait (`pump`) so the window
-never freezes while a MineStar command or a DB query is running.
+* fixed axes fractions — the map box and side table never move, whatever
+  the window size or data volume.  The map keeps equal units
+  (``aspect='equal', adjustable='datalim'``) so the site never stretches;
+  resizing only scales the whole figure, it never re-fits the layout.
+* autonomous lanes drawn as ONE cached PatchCollection (rebuilt only when
+  the lane data actually changes, decimated for draw speed)
+* RAC events scattered by severity, colour legend on the map's left
+* square zones + dashed suppression rings, cluster X marks
+* side table with fixed row height listing RAC events since start
 """
 
 from __future__ import annotations
@@ -25,6 +20,7 @@ import math
 import time
 from collections import deque
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -34,19 +30,42 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.patches import Circle, Polygon, Rectangle
 
 from clustering import Cluster
-from minestar import ExistingZone, cluster_is_suppressed
+from minestar import ExistingZone
 
-# `adjustable="datalim"` keeps the map box a fixed shape (equal units,
-# zooming never stretches it).  Matplotlib logs a "Ignoring fixed ...
-# limits" message whenever it re-fits the limits to keep that aspect —
-# expected here, so matplotlib logging is dropped to WARNING+ to keep
-# the console clean.
+try:
+    matplotlib.rcParams["path.simplify"] = True
+    matplotlib.rcParams["path.simplify_threshold"] = 0.5
+    matplotlib.rcParams["agg.path.chunksize"] = 20000
+except Exception:
+    pass
+
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
 
 PALETE_BG = "#121418"
 PANEL_BG = "#0d0f12"
 TEXT_PRIMARY = "#EAEAEA"
 TEXT_GREY = "#9AA0A6"
+
+# Fixed geometry — set once in __init__, never recomputed.  Fractions of
+# the figure, so resize scales everything proportionally with no jumps.
+LAYOUT = {
+    "colorbar": [0.040, 0.150, 0.018, 0.700],
+    "map": [0.075, 0.080, 0.545, 0.840],
+    "panel": [0.650, 0.080, 0.320, 0.840],
+}
+
+ZONE_IMPORTED_FACE = "#C232A8"
+ZONE_IMPORTED_EDGE = "#FF8AE2"
+ZONE_PROPOSED_FACE = "#2F7BFF"
+ZONE_PROPOSED_EDGE = "#9DC0FF"
+SUPPRESSION_EDGE = "#5B8DEF"
+
+# Max lane vertices drawn per edge before decimation kicks in.
+LANE_STRIDE_2_AT = 40
+LANE_STRIDE_3_AT = 120
+
+# Minimum seconds between full redraws (update/pump/hover all respect it).
+MIN_DRAW_INTERVAL = 0.20
 
 
 def _compact_coord(value: float) -> str:
@@ -56,15 +75,26 @@ def _compact_coord(value: float) -> str:
     return f"{value:.1f}"
 
 
+def _fmt_speed(value: object) -> str:
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "-"
+    if not np.isfinite(v) or v <= 0 or v > 200:
+        return "-"
+    return f"{v:.1f}"
+
+
 class Viewer:
-    """Live-updating site map with an event side table."""
+    """Live-updating site map with an event side table (fixed geometry)."""
 
     def __init__(self) -> None:
         plt.ion()
 
         self.figure = plt.figure(
-            figsize=(14.0, 8.5),
+            figsize=(13.5, 7.8),
             facecolor=PALETE_BG,
+            dpi=100,
         )
 
         try:
@@ -74,34 +104,18 @@ class Viewer:
         except AttributeError:
             pass
 
-        # Manual, aspect-driven layout (no constrained layout, so the
-        # geometry is fixed once and never re-fitted).  Placeholder
-        # positions fill in at startup; `_freeze_layout` re-sizes the
-        # map from the site's data ratio once the site bounds are known,
-        # keeping the severity bar on the map's left and the RAC table
-        # hugging the map's right edge, all centred in the window —
-        # the table never sits at the far right of the window.
-        placeholder = {
-            "map": [0.11, 0.09, 0.48, 0.82],
-            "panel": [0.68, 0.09, 0.28, 0.82],
-            "colorbar": [0.065, 0.16, 0.018, 0.68],
-        }
-        self.map_axis = self.figure.add_axes(placeholder["map"])
-        self.panel_axis = self.figure.add_axes(placeholder["panel"])
+        self.map_axis = self.figure.add_axes(LAYOUT["map"])
+        self.panel_axis = self.figure.add_axes(LAYOUT["panel"])
 
         self.map_axis.set_facecolor(PALETE_BG)
-        # `set_box_aspect` (applied once the site bounds are known) pins
-        # the axes box to a fixed width:height ratio on every draw, so
-        # the map keeps the same shape and unit scale cycle after cycle;
-        # the data limits are only touched when a zoom strays >0.5% from
-        # that ratio, which prevents the per-cycle zoom creep seen with
-        # a plain `adjustable="datalim"`.
-        self.map_axis.set_aspect("equal")
+        # Equal units, fixed box: extra data space pads the limits instead
+        # of reshaping the axes — the table/map never shift on resize.
+        self.map_axis.set_aspect("equal", adjustable="datalim")
         self.map_axis.set_xticks([])
         self.map_axis.set_yticks([])
         for spine in self.map_axis.spines.values():
             spine.set_edgecolor(TEXT_GREY)
-            spine.set_linewidth(1.5)
+            spine.set_linewidth(1.2)
 
         self.event_log: deque[tuple[str, str, str, str, str]] = deque(
             maxlen=100
@@ -109,21 +123,25 @@ class Viewer:
         self._event_coords: deque[tuple[float, float]] = deque(maxlen=100)
         self._panel_scroll: int = 0
 
-        # Cached lane collection.
         self._lane_collection: PatchCollection | None = None
         self._lane_signature: object = None
         self._lane_extent_x: list[float] = []
         self._lane_extent_y: list[float] = []
 
-        # Dynamic artists that get discarded on every repaint.
         self._dynamic: list = []
+        self._loading_text = self.map_axis.text(
+            0.5,
+            0.5,
+            "Loading site…",
+            transform=self.map_axis.transAxes,
+            color=TEXT_GREY,
+            fontsize=11,
+            ha="center",
+            va="center",
+        )
 
-        # The map view is frozen once meaningful data exists, so the map
-        # keeps the same size and shape from cycle to cycle.
         self._fixed_bounds: tuple[float, float, float, float] | None = None
-        self._bounds_home: tuple[float, float, float, float] | None = None
 
-        # Eager severity legend (left of the map) so layout never shifts.
         self._severity_colormap = LinearSegmentedColormap.from_list(
             "rac_severity",
             ["#E4C45C", "#E8873C", "#E23B3B"],
@@ -135,7 +153,7 @@ class Viewer:
         self._severity_mappable.set_array([])
         self._colorbar = self.figure.colorbar(
             self._severity_mappable,
-            cax=self.figure.add_axes(placeholder["colorbar"]),
+            cax=self.figure.add_axes(LAYOUT["colorbar"]),
         )
         self._colorbar.set_ticks([1, 2, 3, 4, 5])
         self._colorbar.set_ticklabels(["1", "2", "3", "4", "5"])
@@ -155,8 +173,8 @@ class Viewer:
             "Level", color=TEXT_GREY, fontweight="bold", labelpad=8
         )
 
-        self._legend = None
-
+        self._last_draw: float = 0.0
+        self._last_hover: float = 0.0
         self._pan_active = False
         self._pan_origin: tuple[float, float] | None = None
         self._pan_xlim: tuple[float, float] | None = None
@@ -184,13 +202,15 @@ class Viewer:
         self.figure.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.figure.canvas.mpl_connect("button_release_event", self._on_button_release)
         self.figure.canvas.mpl_connect("scroll_event", self._on_scroll)
-        self.figure.canvas.mpl_connect("resize_event", self._on_resize)
         self._closed = False
+
+        # Draw the (empty) table immediately so the right panel is never a
+        # white flash on startup.
+        self._draw_panel()
+        self.figure.canvas.draw_idle()
 
         plt.show(block=False)
 
-        # Keep the window from stealing focus when it repaints while the
-        # operator is working in another application.
         try:
             from matplotlib.backends.qt_compat import QtCore
 
@@ -201,6 +221,8 @@ class Viewer:
             )
         except Exception:
             pass
+
+    # -- window events ----------------------------------------------------
 
     def _on_close(self, _event) -> None:
         self._closed = True
@@ -217,11 +239,21 @@ class Viewer:
         elif key is None:
             self._ctrl_down = False
 
+    def _request_draw(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_draw) < MIN_DRAW_INTERVAL:
+            return
+        self._last_draw = now
+        try:
+            self.figure.canvas.draw_idle()
+        except Exception:
+            pass
+
     def _zoom_to_point(self, x: float, y: float, half_window: float = 400.0) -> None:
         try:
             self.map_axis.set_xlim(x - half_window, x + half_window)
             self.map_axis.set_ylim(y - half_window, y + half_window)
-            self.figure.canvas.draw_idle()
+            self._request_draw(force=True)
         except Exception:
             pass
 
@@ -243,7 +275,6 @@ class Viewer:
                 visible_index = int((top - header_height - y) // row_height)
                 if visible_index < 0:
                     return
-                max_rows = int((top - header_height - bottom_margin) // row_height)
                 total = len(self.event_log)
                 if total == 0:
                     return
@@ -290,20 +321,25 @@ class Viewer:
             dy_data = dy_disp * scale
             self.map_axis.set_xlim(x0 - dx_data, x1 - dx_data)
             self.map_axis.set_ylim(y0 - dy_data, y1 - dy_data)
-            self.figure.canvas.draw_idle()
+            self._request_draw()
             return
 
+        # Hover tooltip, debounced so moving the mouse never hammers redraw.
+        now = time.monotonic()
+        if (now - self._last_hover) < 0.08:
+            return
+        self._last_hover = now
         if getattr(event, "inaxes", None) is not self.map_axis:
             if self._zone_annotation.get_visible():
                 self._zone_annotation.set_visible(False)
-                self.figure.canvas.draw_idle()
+                self._request_draw(force=True)
             return
         xdata = getattr(event, "xdata", None)
         ydata = getattr(event, "ydata", None)
         if xdata is None or ydata is None:
             if self._zone_annotation.get_visible():
                 self._zone_annotation.set_visible(False)
-                self.figure.canvas.draw_idle()
+                self._request_draw(force=True)
             return
         for zone in self._hover_zones:
             half = max(zone.half_size, 50.0)
@@ -312,11 +348,11 @@ class Viewer:
                 self._zone_annotation.set_text(zone.name)
                 if not self._zone_annotation.get_visible():
                     self._zone_annotation.set_visible(True)
-                    self.figure.canvas.draw_idle()
+                    self._request_draw(force=True)
                 return
         if self._zone_annotation.get_visible():
             self._zone_annotation.set_visible(False)
-            self.figure.canvas.draw_idle()
+            self._request_draw(force=True)
 
     def _on_button_release(self, event) -> None:
         if getattr(event, "button", None) != 1:
@@ -375,7 +411,7 @@ class Viewer:
                 else:
                     return
             self._draw_panel()
-            self.figure.canvas.draw_idle()
+            self._request_draw(force=True)
             try:
                 self.figure.canvas.flush_events()
             except Exception:
@@ -405,7 +441,7 @@ class Viewer:
         new_y1 = ydata + (y1 - ydata) * factor
         self.map_axis.set_xlim(new_x0, new_x1)
         self.map_axis.set_ylim(new_y0, new_y1)
-        self.figure.canvas.draw_idle()
+        self._request_draw()
 
     def is_open(self) -> bool:
         if self._closed:
@@ -413,17 +449,11 @@ class Viewer:
         return plt.fignum_exists(self.figure.number)
 
     def pump(self, seconds: float = 0.05) -> None:
-        """Process GUI events so the window stays responsive.
-
-        Uses a plain sleep + Qt-backed `flush_events` instead of
-        `plt.pause`, which can re-raise/re-focus the window on every
-        poll cycle and steal focus from other applications.
-        """
+        """Process GUI events so the window stays responsive."""
         if self._closed or not self.is_open():
             return
         try:
             self.figure.canvas.flush_events()
-            self.figure.canvas.draw_idle()
             time.sleep(seconds)
         except Exception:
             pass
@@ -433,10 +463,9 @@ class Viewer:
     # ------------------------------------------------------------------
 
     def add_event(self, row: pd.Series) -> None:
-        """Add a single RAC event row to the panel (newest at top, oldest popped)."""
+        """Add a single RAC event row to the panel (newest at top)."""
         time_text = pd.Timestamp(row["Time"]).strftime("%H:%M:%S")
-        speed = row.get("Speed")
-        speed_text = f"{float(speed):.0f}" if pd.notna(speed) else "-"
+        speed_text = _fmt_speed(row.get("Speed"))
         raw_x = float(row["X"])
         raw_y = float(row["Y"])
         was_at_top = self._panel_scroll == 0
@@ -464,17 +493,18 @@ class Viewer:
             self._panel_scroll = min(self._panel_scroll + grew, max_offset)
 
     # ------------------------------------------------------------------
-    # Lanes (cached)
+    # Lanes (cached, decimated)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _lanes_signature(lanes: pd.DataFrame) -> object:
         if lanes.empty:
             return 0
-        return (
-            lanes.shape,
-            tuple(sorted(lanes["LANE_OID"].unique().tolist())),
-        )
+        try:
+            x_sum = round(float(pd.to_numeric(lanes["X"], errors="coerce").sum()), 1)
+        except Exception:
+            x_sum = 0.0
+        return (len(lanes), int(lanes["LANE_OID"].nunique()), x_sum)
 
     def _rebuild_lanes(self, lanes: pd.DataFrame) -> None:
         signature = self._lanes_signature(lanes)
@@ -483,67 +513,88 @@ class Viewer:
             return
 
         if self._lane_collection is not None:
-            self._lane_collection.remove()
+            try:
+                self._lane_collection.remove()
+            except (ValueError, AttributeError):
+                pass
             self._lane_collection = None
 
         self._lane_extent_x = []
         self._lane_extent_y = []
 
         if not lanes.empty:
+            work = lanes[["LANE_OID", "Segment", "POINT_NR", "X", "Y"]].copy()
+            work["X"] = pd.to_numeric(work["X"], errors="coerce")
+            work["Y"] = pd.to_numeric(work["Y"], errors="coerce")
+            work["POINT_NR"] = pd.to_numeric(work["POINT_NR"], errors="coerce")
+            work = work.dropna(subset=["X", "Y", "POINT_NR"])
+            seg = work["Segment"].astype(str).str.lower().to_numpy()
+            left_mask = seg == "left"
+            right_mask = seg == "right"
+            left = work[left_mask].sort_values(["LANE_OID", "POINT_NR"])
+            right = work[right_mask].sort_values(["LANE_OID", "POINT_NR"])
+
             patches: list[Polygon] = []
+            xs_all: list[float] = []
+            ys_all: list[float] = []
 
-            for _, lane in lanes.groupby("LANE_OID"):
-                left = lane[
-                    lane["Segment"].astype(str).str.lower() == "left"
-                ].sort_values("POINT_NR")
-                right = lane[
-                    lane["Segment"].astype(str).str.lower() == "right"
-                ].sort_values("POINT_NR")
-
-                if left.empty or right.empty:
+            for oid, lg in left.groupby("LANE_OID", sort=False):
+                try:
+                    rg = right[right["LANE_OID"] == oid]
+                except Exception:
                     continue
-
-                x_coords = (
-                    left["X"].astype(float).tolist()
-                    + right["X"].astype(float).tolist()[::-1]
-                )
-                y_coords = (
-                    left["Y"].astype(float).tolist()
-                    + right["Y"].astype(float).tolist()[::-1]
-                )
-
+                if rg.empty:
+                    continue
+                lx = lg["X"].to_numpy(dtype=float)
+                ly = lg["Y"].to_numpy(dtype=float)
+                rx = rg["X"].to_numpy(dtype=float)[::-1]
+                ry = rg["Y"].to_numpy(dtype=float)[::-1]
+                # Decimate long edges: halves/thirds the vertex count.
+                if len(lx) > LANE_STRIDE_3_AT:
+                    lx = lx[::3]
+                    ly = ly[::3]
+                elif len(lx) > LANE_STRIDE_2_AT:
+                    lx = lx[::2]
+                    ly = ly[::2]
+                if len(rx) > LANE_STRIDE_3_AT:
+                    rx = rx[::3]
+                    ry = ry[::3]
+                elif len(rx) > LANE_STRIDE_2_AT:
+                    rx = rx[::2]
+                    ry = ry[::2]
+                if len(lx) < 2 or len(rx) < 2:
+                    continue
+                x_coords = np.concatenate([lx, rx])
+                y_coords = np.concatenate([ly, ry])
                 patches.append(
                     Polygon(
-                        list(zip(x_coords, y_coords)),
+                        np.column_stack([x_coords, y_coords]),
                         closed=True,
-                        facecolor="#1F3A22",
-                        edgecolor="#35C759",
-                        linewidth=0.3,
-                        alpha=0.55,
                     )
                 )
-
-                self._lane_extent_x.extend(x_coords)
-                self._lane_extent_y.extend(y_coords)
+                xs_all.extend([float(x_coords.min()), float(x_coords.max())])
+                ys_all.extend([float(y_coords.min()), float(y_coords.max())])
 
             if patches:
                 self._lane_collection = PatchCollection(
-                    patches, match_original=True
+                    patches,
+                    facecolor="#1F3A22",
+                    edgecolor="#35C759",
+                    linewidths=0.35,
+                    alpha=0.55,
                 )
                 self.map_axis.add_collection(self._lane_collection)
+                self._lane_extent_x = xs_all
+                self._lane_extent_y = ys_all
+                # New footprint invalidates the frozen view once.
+                if self._fixed_bounds is not None:
+                    self._fixed_bounds = None
 
         self._lane_signature = signature
 
     # ------------------------------------------------------------------
 
     def _discard_dynamic(self) -> None:
-        if self._legend is not None:
-            try:
-                self._legend.remove()
-            except (ValueError, AttributeError):
-                pass
-            self._legend = None
-
         for artist in self._dynamic:
             try:
                 artist.remove()
@@ -569,99 +620,80 @@ class Viewer:
         self._discard_dynamic()
         self._rebuild_lanes(lanes)
 
-        handles = []
-
-        # Existing zones + suppression areas -------------------------------
+        # Existing zones + suppression rings -------------------------------
         for zone in existing_zones:
-            center = (zone.center_x, zone.center_y)
             half = max(zone.half_size, zone_size / 2.0)
-
             if zone.proposed:
-                zone_patch = Rectangle(
-                    (zone.center_x - half, zone.center_y - half),
-                    2 * half,
-                    2 * half,
-                    facecolor="#2563EB",
-                    edgecolor="#93C5FD",
-                    linestyle="-",
-                    linewidth=1.8,
-                    alpha=0.80,
-                    zorder=2,
-                )
-                suppression_patch = Circle(
-                    center,
-                    suppression_radius,
-                    fill=False,
-                    edgecolor="#60A5FA",
-                    linestyle=":",
-                    linewidth=1.4,
-                    alpha=0.85,
-                    zorder=2,
-                )
+                face, edge = ZONE_PROPOSED_FACE, ZONE_PROPOSED_EDGE
             else:
-                zone_patch = Rectangle(
-                    (zone.center_x - half, zone.center_y - half),
-                    2 * half,
-                    2 * half,
-                    facecolor="#2563EB",
-                    edgecolor="#93C5FD",
-                    linestyle="-",
-                    linewidth=1.4,
-                    alpha=0.80,
-                    zorder=2,
-                )
-                suppression_patch = Circle(
-                    center,
-                    suppression_radius,
-                    fill=False,
-                    edgecolor="#60A5FA",
-                    linestyle=":",
-                    linewidth=1.4,
-                    alpha=0.85,
-                    zorder=2,
-                )
-
+                face, edge = ZONE_IMPORTED_FACE, ZONE_IMPORTED_EDGE
+            zone_patch = Rectangle(
+                (zone.center_x - half, zone.center_y - half),
+                2 * half,
+                2 * half,
+                facecolor=face,
+                edgecolor=edge,
+                linestyle="-",
+                linewidth=1.6,
+                alpha=0.80,
+                zorder=2,
+            )
+            suppression_patch = Circle(
+                (zone.center_x, zone.center_y),
+                suppression_radius,
+                fill=False,
+                edgecolor=SUPPRESSION_EDGE,
+                linestyle=":",
+                linewidth=1.0,
+                alpha=0.45,
+                zorder=2,
+            )
             axis.add_patch(zone_patch)
             axis.add_patch(suppression_patch)
             self._dynamic.extend([zone_patch, suppression_patch])
+            if zone.proposed:
+                tag = axis.text(
+                    zone.center_x,
+                    zone.center_y + half + 12.0,
+                    "PROPOSED",
+                    color=ZONE_PROPOSED_EDGE,
+                    fontsize=7,
+                    fontweight="bold",
+                    ha="center",
+                    va="bottom",
+                    zorder=7,
+                )
+                self._dynamic.append(tag)
 
         self._hover_zones = list(existing_zones)
 
         # RAC events -----------------------------------------------------
         if not events.empty:
+            try:
+                x = pd.to_numeric(events["X"], errors="coerce").to_numpy(dtype=float)
+                y = pd.to_numeric(events["Y"], errors="coerce").to_numpy(dtype=float)
+                lv = pd.to_numeric(events["Level"], errors="coerce").to_numpy(dtype=float)
+            except Exception:
+                x = events["X"].to_numpy()
+                y = events["Y"].to_numpy()
+                lv = events["Level"].to_numpy()
             collection = axis.scatter(
-                events["X"],
-                events["Y"],
-                c=events["Level"],
+                x,
+                y,
+                c=lv,
                 cmap=self._severity_colormap,
                 norm=Normalize(1, 5),
-                s=34,
+                s=28,
                 edgecolors="black",
-                linewidths=0.4,
+                linewidths=0.35,
                 alpha=0.95,
                 zorder=5,
-                label="RAC events",
             )
             self._dynamic.append(collection)
-            handles.append(collection)
-
-            self._colorbar.update_normal(collection)
             try:
-                self._colorbar.set_ticks([1, 2, 3, 4, 5])
-                self._colorbar.set_ticklabels(["1", "2", "3", "4", "5"])
+                self._colorbar.update_normal(collection)
             except Exception:
                 pass
-            self._colorbar.ax.yaxis.set_label_position("left")
-            self._colorbar.ax.yaxis.set_ticks_position("left")
-            self._colorbar.ax.tick_params(
-                colors=TEXT_GREY,
-                labelsize=7,
-                left=True,
-                right=False,
-                labelleft=True,
-                labelright=False,
-                pad=3,
-            )
 
         # Qualifying clusters ---------------------------------------------
         for cluster in clusters:
@@ -682,42 +714,42 @@ class Viewer:
                 [draw_y],
                 marker="x",
                 color=x_rgba,
-                s=130,
-                linewidths=2.4,
+                s=120,
+                linewidths=2.2,
                 zorder=6,
             )
+            avg_spd = getattr(cluster, "average_speed_kmh", None)
             speed_text = (
-                f"{cluster.average_speed_kmh:.0f}"
-                if cluster.average_speed_kmh
-                else "-"
+                f"{float(avg_spd):.0f}"
+                if avg_spd and np.isfinite(float(avg_spd)) else "-"
             )
             label = axis.text(
                 draw_x,
                 draw_y,
-                (
-                    f" {cluster.event_count} evt"
-                    f", spd {speed_text}"
-                ),
+                f" {cluster.event_count} evt, spd {speed_text}",
                 color="white",
                 fontsize=7,
                 zorder=7,
             )
             self._dynamic.extend([mark, label])
 
-        # Bounds: frozen once the site extent is known ----------------------
+        # Frozen view: lanes define the footprint; set once, then never
+        # touch the limits again (user pan/zoom is preserved).  The axes
+        # box itself never moves — only data limits change, once.
         if self._fixed_bounds is None:
-            self._fixed_bounds = self._resolve_bounds(
-                events,
-                existing_zones,
-                suppression_radius,
-            )
-
-        # Freeze the map view exactly once: size the layout from the site's
-        # aspect ratio (table hugging the map) and pin the box so the
-        # limits are never re-fitted and the map neither creeps nor
-        # stretches while zooming.
-        if self._fixed_bounds is not None and self._bounds_home is None:
-            self._freeze_layout(self._fixed_bounds)
+            self._fixed_bounds = self._resolve_bounds(events)
+        if self._fixed_bounds is not None:
+            if self._loading_text is not None:
+                try:
+                    self._loading_text.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self._loading_text = None  # type: ignore[assignment]
+            # Only apply when the user hasn't taken over the view: don't
+            # stomp an active pan/zoom.  First set always applies.
+            if not self._pan_active and not getattr(self, "_view_set", False):
+                self._set_view(self._fixed_bounds)
+                self._view_set = True  # type: ignore[attr-defined]
 
         axis.set_title(
             (
@@ -726,107 +758,20 @@ class Viewer:
                 f"  |  Clusters: {len(clusters)}"
             ),
             color=TEXT_PRIMARY,
-            fontsize=12,
+            fontsize=11,
             fontweight="bold",
             loc="left",
         )
 
         self._draw_panel()
-        self.figure.canvas.draw_idle()
-        self.figure.canvas.flush_events()
+        self._request_draw()
 
     # ------------------------------------------------------------------
-    # Map bounds (frozen)
+    # Map bounds (frozen, lanes-only)
     # ------------------------------------------------------------------
-
-    def _apply_three_section_layout(
-        self, bounds: tuple[float, float, float, float]
-    ) -> None:
-        min_x, max_x, min_y, max_y = bounds
-        span_x = max_x - min_x
-        span_y = max_y - min_y
-        if span_x <= 0 or span_y <= 0:
-            return
-
-        fig_w, fig_h = self.figure.get_size_inches()
-        fig_aspect = fig_w / fig_h
-        pixel_ratio = span_x / span_y
-        fraction_ratio = pixel_ratio / fig_aspect
-
-        left_spacer = 0.04
-        right_spacer = 0.04
-        bottom_gap = 0.06
-        top_gap = 0.06
-        colorbar_w = 0.018
-        colorbar_gap = 0.012
-        gap_between = 0.04
-        table_quadrant_w = 0.28
-        table_w = table_quadrant_w
-        colorbar_height = 0.78
-
-        avail_h = 1.0 - bottom_gap - top_gap
-        avail_w = 1.0 - left_spacer - right_spacer
-        map_group_avail_w = avail_w - gap_between - table_quadrant_w
-        usable_map_w = map_group_avail_w - colorbar_w - colorbar_gap
-
-        if avail_h * fraction_ratio <= usable_map_w:
-            map_h = avail_h
-            map_w = map_h * fraction_ratio
-        else:
-            map_w = usable_map_w
-            map_h = map_w / fraction_ratio
-
-        map_group_w = colorbar_w + colorbar_gap + map_w
-        map_group_x = left_spacer + (map_group_avail_w - map_group_w) / 2.0
-        map_group_y = bottom_gap + (avail_h - map_h) / 2.0
-
-        colorbar_x = map_group_x
-        colorbar_h = map_h * colorbar_height
-        colorbar_y = map_group_y + (map_h - colorbar_h) / 2.0
-
-        map_x = colorbar_x + colorbar_w + colorbar_gap
-        map_y = map_group_y
-
-        table_quadrant_x = left_spacer + map_group_avail_w + gap_between
-        table_x = table_quadrant_x + (table_quadrant_w - table_w) / 2.0
-        table_y = bottom_gap + (avail_h - map_h) / 2.0
-
-        self._colorbar.ax.set_position(
-            [colorbar_x, colorbar_y, colorbar_w, colorbar_h]
-        )
-        self.map_axis.set_position([map_x, map_y, map_w, map_h])
-        self.panel_axis.set_position([table_x, table_y, table_w, map_h])
-
-        self.map_axis.set_box_aspect(span_y / span_x)
-
-    def _on_resize(self, event) -> None:
-        if self._bounds_home is not None:
-            try:
-                self._apply_three_section_layout(self._bounds_home)
-                self.figure.canvas.draw_idle()
-            except Exception:
-                pass
-
-    def _freeze_layout(
-        self, bounds: tuple[float, float, float, float]
-    ) -> None:
-        """
-        Three-section horizontal flow — left spacer | Map Group | Table Quadrant.
-
-        * Left spacer pushes everything toward the center.
-        * Map Group (heat indicator + haul-road map) is one locked unit,
-          sized from the site's data ratio and centered-left.
-        * Table Quadrant on the right is its own area; the table panel is
-          centered both vertically and horizontally inside that quadrant
-          so it looks balanced against the map, not stuck at the top-left.
-        Runs once, the first cycle that has a site extent.
-        """
-        self._apply_three_section_layout(bounds)
-        self._bounds_home = bounds
-        self._set_view(bounds)
 
     def _set_view(self, bounds) -> None:
-        """Apply the frozen home limits (the box is pinned to its ratio)."""
+        """Apply the frozen home limits (axes box itself never moves)."""
         min_x, max_x, min_y, max_y = bounds
         self.map_axis.set_xlim(min_x, max_x)
         self.map_axis.set_ylim(min_y, max_y)
@@ -834,36 +779,21 @@ class Viewer:
     def _resolve_bounds(
         self,
         events: pd.DataFrame,
-        existing_zones: list[ExistingZone],
-        suppression_radius: float,
     ) -> tuple[float, float, float, float] | None:
-        """
-        Compute a fixed map extent (min_x, max_x, min_y, max_y).
-
-        The lane network defines the site footprint; the suppression
-        circles around the zones extend beyond it, so both are included.
-        Falls back to events/zones if lanes are not yet loaded.
-        """
+        """Fixed map extent from the lane footprint, else events."""
         x_values = list(self._lane_extent_x)
         y_values = list(self._lane_extent_y)
 
-        for zone in existing_zones:
-            x_values.extend(
-                [
-                    zone.center_x - suppression_radius,
-                    zone.center_x + suppression_radius,
-                ]
-            )
-            y_values.extend(
-                [
-                    zone.center_y - suppression_radius,
-                    zone.center_y + suppression_radius,
-                ]
-            )
-
         if not x_values and not events.empty:
-            x_values.extend(events["X"].astype(float).tolist())
-            y_values.extend(events["Y"].astype(float).tolist())
+            try:
+                x_values.extend(
+                    pd.to_numeric(events["X"], errors="coerce").dropna().astype(float).tolist()
+                )
+                y_values.extend(
+                    pd.to_numeric(events["Y"], errors="coerce").dropna().astype(float).tolist()
+                )
+            except Exception:
+                pass
 
         if not x_values:
             return None
@@ -886,16 +816,7 @@ class Viewer:
     # ------------------------------------------------------------------
 
     def _draw_panel(self) -> None:
-        """
-        Draw the RAC event list as a compact data-entry style table.
-
-        Rows have a fixed height (no stretching when the list is short).
-        Column widths are proportional to content so TIME/X/Y get more
-        room and km/h no longer clips at the edge; values are centred
-        in their cells so neighbours never overlap.  The overall panel
-        geometry is kept identical before and after `_freeze_layout` so
-        the good initial gapage is preserved when data populates.
-        """
+        """Draw the RAC event list as a compact data-entry style table."""
         panel = self.panel_axis
         panel.clear()
         panel.set_facecolor(PANEL_BG)
@@ -1084,7 +1005,7 @@ def wait_for_next_cycle(
     seconds: int,
     viewer: Viewer | None,
 ) -> bool:
-    """Wait while keeping the viewer's event loop live."""
+    """Wait while keeping the viewer's event loop live (throttled)."""
     import time
 
     deadline = time.monotonic() + seconds
@@ -1093,7 +1014,7 @@ def wait_for_next_cycle(
         if viewer is not None:
             if not viewer.is_open():
                 return False
-            viewer.pump()
+            viewer.pump(0.1)
         else:
             time.sleep(0.1)
 
