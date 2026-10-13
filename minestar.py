@@ -146,15 +146,23 @@ class MineStar:
         return output_file, zone_name
 
     def import_zone(self, xml_file: Path) -> str:
-        is_sim = getattr(self.config, "simulation_enabled", False) or getattr(self.config, "_is_simulated", False)
+        cfg = self.config
+        # Global preview switch: never touch mstarrun, keep XML for review.
+        if bool(getattr(cfg, "show_only", False)):
+            logger.info("Show-only mode: zone %s PROPOSED only, file kept: %s", xml_file.name, xml_file)
+            return "disabled"
+        is_sim = getattr(cfg, "simulation_enabled", False) or getattr(cfg, "_is_simulated", False)
         # simulation import control via simulation.import_enabled
         if is_sim:
-            do_import = bool(getattr(self.config, "simulation_import_enabled", False))
+            do_import = bool(getattr(cfg, "simulation_import_enabled", False))
         else:
-            do_import = True
+            do_import = bool(getattr(cfg, "import_enabled", False))
         if not do_import:
-            logger.info("Import disabled (simulation import_enabled=false). XML kept: %s", xml_file)
+            logger.info("Import disabled (import_enabled=false). XML kept: %s", xml_file)
             return "disabled"
+        if bool(getattr(cfg, "dry_run", False)):
+            logger.info("Dry run: zone %s NOT imported, file kept: %s", xml_file.name, xml_file)
+            return "dry_run"
         bin_target = self.executable.parent / "zones.xml"
         try:
             bin_target.parent.mkdir(parents=True, exist_ok=True)

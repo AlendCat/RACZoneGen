@@ -251,9 +251,14 @@ def run_cycle(
             submitted = 0
             proposed_shown = 0
             is_sim = isinstance(database, SimulatedDatabase)
-            do_import = True
-            if is_sim:
+            if getattr(config, "show_only", False):
+                do_import = False
+            elif is_sim:
                 do_import = bool(getattr(config, "simulation_import_enabled", False))
+            else:
+                do_import = bool(getattr(config, "import_enabled", False)) and not bool(
+                    getattr(config, "dry_run", False)
+                )
 
             for cluster in actionable_clusters:
                 if cluster_is_suppressed(
@@ -276,7 +281,7 @@ def run_cycle(
                 if speed_limit is None:
                     continue
 
-                if is_sim and not do_import:
+                if not do_import:
                     xml_file, zone_name = minestar.create_zone_xml(
                         cluster, speed_limit
                     )
@@ -292,7 +297,7 @@ def run_cycle(
                         speed_limit,
                     )
                     logger.info(
-                        "Simulation import disabled: zone %s PROPOSED only, file kept: %s",
+                        "Import disabled: zone %s PROPOSED only, file kept: %s",
                         zone_name,
                         xml_file,
                     )
@@ -405,8 +410,8 @@ def run_cycle(
                 elif status == "failed":
                     import_failed = True
 
-            if is_sim and not do_import:
-                logger.info("%d PROPOSED zone(s) (simulation import disabled, files kept).", proposed_shown)
+            if not do_import:
+                logger.info("%d PROPOSED zone(s) (import disabled, files kept).", proposed_shown)
             elif proposed_shown > 0 and submitted == 0:
                 logger.info("%d PROPOSED zone(s) (import disabled).", proposed_shown)
             elif proposed_shown > 0:
@@ -508,6 +513,14 @@ def main() -> None:
         config.maximum_speed_kmh,
         config.payload_speed_divisor,
     )
+    if getattr(config, "show_only", False):
+        logger.info("Import mode: SHOW-ONLY (preview, mstarrun never runs)")
+    elif not getattr(config, "import_enabled", False):
+        logger.info("Import mode: DISABLED (preview only, files kept)")
+    elif getattr(config, "dry_run", False):
+        logger.info("Import mode: DRY-RUN (preview only, files kept)")
+    else:
+        logger.info("Import mode: LIVE (zones will be imported via mstarrun)")
     if simulate:
         logger.info("Data source: SIMULATED (synthetic RAC, live lanes/zones) import_enabled=%s", getattr(config, "simulation_import_enabled", False))
     else:

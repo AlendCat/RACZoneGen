@@ -206,9 +206,12 @@ class Config:
             self.mstarrun_location = (self.mstar_bin_directory / self.mstar_executable).resolve()
         self.current_zones_file = (self.config_dir / "runtime" / "current_zones.xml").resolve()
         self.command_timeout_seconds = 120
-        self.import_enabled = True
-        self.dry_run = False
-        self.show_only = False
+        # Import gates — actually read from config (previously hardcoded, so
+        # these settings were silently ignored and live ALWAYS imported).
+        # Safe defaults: read-only until explicitly enabled (matches docs).
+        self.import_enabled = parser.getboolean("minestar", "import_enabled", fallback=False)
+        self.dry_run = parser.getboolean("minestar", "dry_run", fallback=True)
+        self.show_only = parser.getboolean("minestar", "show_only", fallback=False)
         self.allow_outside_mine_boundary = False
         self.import_workers = 1
         self.simulation_enabled = parser.getboolean("simulation", "enabled", fallback=False)
