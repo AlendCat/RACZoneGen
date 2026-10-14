@@ -103,27 +103,9 @@ def wait_with_viewer(
             raise
 
 
-def _read_zones(
-    database: Database | SimulatedDatabase,
-    minestar: MineStar,
-    config: Config,
-    viewer: Viewer | None,
-    executor: ThreadPoolExecutor,
-) -> list:
-    future = executor.submit(
-        database.read_existing_zones,
-        config.zones_query_file,
-        config.zone_name_prefix,
-    )
-    return wait_with_viewer(future, viewer, timeout=60)
-
-
-def run_cycle(
+def poll_once(
     config: Config,
     database: Database | SimulatedDatabase,
-    minestar: MineStar,
-    viewer: Viewer | None,
-    executor: ThreadPoolExecutor,
     previous_event_counts: Counter | None,
     existing_zones: list,
     last_lanes: pd.DataFrame,
@@ -131,8 +113,16 @@ def run_cycle(
     last_zone_refresh: float,
     persistent_clusters: list | None = None,
     used_sigs: set | None = None,
-) -> tuple[Counter | None, list, pd.DataFrame, float, float, list, set]:
-    """One full polling cycle. Returns updated state."""
+) -> dict:
+    """Blocking poll half: DB reads + clustering.
+
+    Runs on the poll worker thread — never touches the viewer or MineStar.
+    All blocking I/O (RAC / lanes / zones reads) and the CPU-heavy grouping
+    happen here so the GUI thread stays responsive even when the DB is slow.
+    State objects (persistent_clusters / used_sigs) are owned by the worker
+    for the duration of the call; the main thread must not touch them until
+    the future completes.
+    """
 
     raw_events = database.read_rac_events(
         config.rac_query_file,
@@ -144,16 +134,13 @@ def run_cycle(
     )
     first_sample = previous_event_counts is None
 
-    # ---- 2. Lanes (throttled; failure is non-fatal) ---------------------
+    # ---- Lanes (throttled; failure is non-fatal) ------------------------
     now = time.monotonic()
 
     if (
-        lanes_are_stale := (
-            (now - last_lane_refresh)
-            >= config.lane_refresh_interval_seconds
-        )
-        or last_lanes.empty
-    ):
+        (now - last_lane_refresh)
+        >= config.lane_refresh_interval_seconds
+    ) or last_lanes.empty:
         try:
             last_lanes = database.read_lanes(config.lane_query_file)
             last_lane_refresh = now
@@ -162,13 +149,16 @@ def run_cycle(
                 "Lane refresh failed. Retaining previous lanes."
             )
 
-    # ---- 3. Refresh existing zones (throttled; failure blocks imports) --
+    # ---- Existing zones (throttled; failure blocks imports) -------------
     zones_are_current = True
 
     if (now - last_zone_refresh) >= config.zones_refresh_interval_seconds:
         zones_are_current = False
         try:
-            existing_zones = _read_zones(database, minestar, config, viewer, executor)
+            existing_zones = database.read_existing_zones(
+                config.zones_query_file,
+                config.zone_name_prefix,
+            )
             last_zone_refresh = now
             zones_are_current = True
         except Exception:
@@ -176,8 +166,6 @@ def run_cycle(
                 "MineStar zone refresh failed. New zone imports are "
                 "blocked this cycle."
             )
-    else:
-        zones_are_current = True
 
     if persistent_clusters is None:
         persistent_clusters = []
@@ -194,6 +182,78 @@ def run_cycle(
         score_threshold=config.grouping_score,
         threshold_inclusive=True,
     )
+
+    return {
+        "events": events,
+        "current_event_counts": current_event_counts,
+        "previous_event_counts": previous_event_counts,
+        "new_event_count": new_event_count,
+        "first_sample": first_sample,
+        "clusters": persistent_clusters,
+        "persistent_clusters": persistent_clusters,
+        "used_sigs": used_sigs,
+        "existing_zones": existing_zones,
+        "last_lanes": last_lanes,
+        "last_lane_refresh": last_lane_refresh,
+        "last_zone_refresh": last_zone_refresh,
+        "zones_are_current": zones_are_current,
+        "is_sim": isinstance(database, SimulatedDatabase),
+    }
+
+
+def run_cycle(
+    config: Config,
+    database: Database | SimulatedDatabase,
+    minestar: MineStar,
+    viewer: Viewer | None,
+    executor: ThreadPoolExecutor,
+    previous_event_counts: Counter | None,
+    existing_zones: list,
+    last_lanes: pd.DataFrame,
+    last_lane_refresh: float,
+    last_zone_refresh: float,
+    persistent_clusters: list | None = None,
+    used_sigs: set | None = None,
+) -> tuple[Counter | None, list, pd.DataFrame, float, float, list, set]:
+    """One full polling cycle (synchronous). Returns updated state."""
+    poll = poll_once(
+        config,
+        database,
+        previous_event_counts,
+        existing_zones,
+        last_lanes,
+        last_lane_refresh,
+        last_zone_refresh,
+        persistent_clusters,
+        used_sigs,
+    )
+    return finish_cycle(config, minestar, viewer, executor, poll)
+
+
+def finish_cycle(
+    config: Config,
+    minestar: MineStar,
+    viewer: Viewer | None,
+    executor: ThreadPoolExecutor,
+    poll: dict,
+) -> tuple[Counter | None, list, pd.DataFrame, float, float, list, set]:
+    """Main-thread half of a cycle: zone decisions, imports, commit, redraw.
+
+    Must run on the GUI thread (matplotlib). The blocking poll half runs on
+    the poll worker via :func:`poll_once`.
+    """
+    events = poll["events"]
+    current_event_counts = poll["current_event_counts"]
+    previous_event_counts = poll["previous_event_counts"]
+    new_event_count = poll["new_event_count"]
+    first_sample = poll["first_sample"]
+    existing_zones = poll["existing_zones"]
+    last_lanes = poll["last_lanes"]
+    last_lane_refresh = poll["last_lane_refresh"]
+    last_zone_refresh = poll["last_zone_refresh"]
+    zones_are_current = poll["zones_are_current"]
+    persistent_clusters = poll["persistent_clusters"]
+    used_sigs = poll["used_sigs"]
     clusters: list = persistent_clusters
 
     # ---- 4. New events → clusters → zones → background import ----------
@@ -250,7 +310,7 @@ def run_cycle(
             import_failed = False
             submitted = 0
             proposed_shown = 0
-            is_sim = isinstance(database, SimulatedDatabase)
+            is_sim = poll["is_sim"]
             if getattr(config, "show_only", False):
                 do_import = False
             elif is_sim:
@@ -547,7 +607,10 @@ def main() -> None:
     minestar = MineStar(config)
     viewer = Viewer()
     viewer.pump(0.1)  # first paint (loading state) before any DB blocks
-    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mstar")
+    # Two pools: DB/clustering reads never queue behind a slow mstarrun
+    # import, and imports stay serialized on their own worker.
+    db_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="poll")
+    import_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mstar-import")
 
     previous_event_counts: Counter | None = None
     existing_zones: list = []
@@ -561,10 +624,10 @@ def main() -> None:
     last_zone_refresh = 0.0
 
     # ---- Startup: pull lanes + zone library IN PARALLEL -----------------
-    # Both queries run concurrently on the 2-worker pool while the viewer
+    # Both queries run concurrently on the poll pool while the viewer
     # keeps pumping, so the window paints instantly instead of hanging.
-    lane_future = executor.submit(database.read_lanes, config.lane_query_file)
-    zone_future = executor.submit(
+    lane_future = db_executor.submit(database.read_lanes, config.lane_query_file)
+    zone_future = db_executor.submit(
         database.read_existing_zones,
         config.zones_query_file,
         config.zone_name_prefix,
@@ -601,8 +664,45 @@ def main() -> None:
             pass
 
     try:
+        pending_poll = None
         while True:
             cycle_started = time.monotonic()
+
+            # Submit the blocking poll (RAC + lanes + zones + clustering)
+            # to the worker; the GUI thread only pumps and draws.
+            if pending_poll is None:
+                pending_poll = db_executor.submit(
+                    poll_once,
+                    config,
+                    database,
+                    previous_event_counts,
+                    existing_zones,
+                    last_lanes,
+                    last_lane_refresh,
+                    last_zone_refresh,
+                    persistent_clusters,
+                    used_sigs,
+                )
+
+            wait_seconds = max(int(config.poll_interval_seconds), 1)
+            try:
+                poll = wait_with_viewer(pending_poll, viewer, timeout=wait_seconds)
+            except TimeoutError:
+                logger.warning(
+                    "Poll still running (slow DB); GUI stays live, "
+                    "picking the result up next loop."
+                )
+                continue
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                logger.exception(
+                    "Polling cycle failed. No zones imported this cycle."
+                )
+                pending_poll = None
+                continue
+
+            pending_poll = None
 
             try:
                 (
@@ -613,19 +713,12 @@ def main() -> None:
                     last_zone_refresh,
                     persistent_clusters,
                     used_sigs,
-                ) = run_cycle(
+                ) = finish_cycle(
                     config,
-                    database,
                     minestar,
                     viewer,
-                    executor,
-                    previous_event_counts,
-                    existing_zones,
-                    last_lanes,
-                    last_lane_refresh,
-                    last_zone_refresh,
-                    persistent_clusters,
-                    used_sigs,
+                    import_executor,
+                    poll,
                 )
             except KeyboardInterrupt:
                 raise
@@ -656,7 +749,8 @@ def main() -> None:
         logger.info("Stopped by user.")
 
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        db_executor.shutdown(wait=True, cancel_futures=True)
+        import_executor.shutdown(wait=True, cancel_futures=True)
         database.dispose()
         logger.info("RACZoneGen stopped.")
 

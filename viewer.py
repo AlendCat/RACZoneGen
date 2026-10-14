@@ -128,7 +128,13 @@ class Viewer:
         self._lane_extent_x: list[float] = []
         self._lane_extent_y: list[float] = []
 
-        self._dynamic: list = []
+        # Pooled map artists (incremental redraw: updated in place, never
+        # discarded/recreated per cycle).
+        self._event_scatter = None
+        self._zone_artists: list = []
+        self._cluster_scatter = None
+        self._cluster_labels: list = []
+        self._frame_sig: object = None
         self._loading_text = self.map_axis.text(
             0.5,
             0.5,
@@ -155,23 +161,7 @@ class Viewer:
             self._severity_mappable,
             cax=self.figure.add_axes(LAYOUT["colorbar"]),
         )
-        self._colorbar.set_ticks([1, 2, 3, 4, 5])
-        self._colorbar.set_ticklabels(["1", "2", "3", "4", "5"])
-        self._colorbar.ax.set_title("RAC", color=TEXT_GREY, fontsize=8, loc="left", pad=6)
-        self._colorbar.ax.yaxis.set_label_position("left")
-        self._colorbar.ax.yaxis.set_ticks_position("left")
-        self._colorbar.ax.tick_params(
-            colors=TEXT_GREY,
-            labelsize=7,
-            left=True,
-            right=False,
-            labelleft=True,
-            labelright=False,
-            pad=3,
-        )
-        self._colorbar.set_label(
-            "Level", color=TEXT_GREY, fontweight="bold", labelpad=8
-        )
+        self._style_colorbar()
 
         self._last_draw: float = 0.0
         self._last_hover: float = 0.0
@@ -594,64 +584,83 @@ class Viewer:
 
     # ------------------------------------------------------------------
 
-    def _discard_dynamic(self) -> None:
-        for artist in self._dynamic:
-            try:
-                artist.remove()
-            except (ValueError, AttributeError):
-                pass
-        self._dynamic = []
+    def _style_colorbar(self) -> None:
+        """Pin the severity legend: ticks + numbers on the LEFT of the bar.
 
-    def update(
+        Re-applied after every ``update_normal`` because resyncing the
+        mappable can reset tick placement back to the right side.
+        """
+        try:
+            self._colorbar.set_ticks([1, 2, 3, 4, 5])
+            self._colorbar.set_ticklabels(["1", "2", "3", "4", "5"])
+            self._colorbar.ax.set_title(
+                "RAC", color=TEXT_GREY, fontsize=8, loc="left", pad=6
+            )
+            self._colorbar.ax.yaxis.set_label_position("left")
+            self._colorbar.ax.yaxis.set_ticks_position("left")
+            self._colorbar.ax.tick_params(
+                colors=TEXT_GREY,
+                labelsize=7,
+                left=True,
+                right=False,
+                labelleft=True,
+                labelright=False,
+                pad=2,
+            )
+            self._colorbar.set_label(
+                "Level", color=TEXT_GREY, fontweight="bold", labelpad=8
+            )
+        except Exception:
+            pass
+
+    def _sync_zones(
         self,
-        events: pd.DataFrame,
-        lanes: pd.DataFrame,
-        clusters: list[Cluster],
         existing_zones: list[ExistingZone],
         suppression_radius: float,
         zone_size: float,
-        grouping_radius: float,
     ) -> None:
-        """Redraw the map and panel; lanes only when they actually change."""
-        if not self.is_open():
-            return
-
+        """Update the pooled zone + suppression-ring + tag artists."""
         axis = self.map_axis
-        self._discard_dynamic()
-        self._rebuild_lanes(lanes)
-
-        # Existing zones + suppression rings -------------------------------
-        for zone in existing_zones:
+        pool = self._zone_artists
+        for i, zone in enumerate(existing_zones):
             half = max(zone.half_size, zone_size / 2.0)
             if zone.proposed:
                 face, edge = ZONE_PROPOSED_FACE, ZONE_PROPOSED_EDGE
             else:
                 face, edge = ZONE_IMPORTED_FACE, ZONE_IMPORTED_EDGE
-            zone_patch = Rectangle(
-                (zone.center_x - half, zone.center_y - half),
-                2 * half,
-                2 * half,
-                facecolor=face,
-                edgecolor=edge,
-                linestyle="-",
-                linewidth=1.6,
-                alpha=0.80,
-                zorder=2,
-            )
-            suppression_patch = Circle(
-                (zone.center_x, zone.center_y),
-                suppression_radius,
-                fill=False,
-                edgecolor=SUPPRESSION_EDGE,
-                linestyle=":",
-                linewidth=1.0,
-                alpha=0.45,
-                zorder=2,
-            )
-            axis.add_patch(zone_patch)
-            axis.add_patch(suppression_patch)
-            self._dynamic.extend([zone_patch, suppression_patch])
-            if zone.proposed:
+            if i < len(pool):
+                rect, circ, tag = pool[i]
+                rect.set_xy((zone.center_x - half, zone.center_y - half))
+                rect.set_width(2 * half)
+                rect.set_height(2 * half)
+                rect.set_facecolor(face)
+                rect.set_edgecolor(edge)
+                rect.set_visible(True)
+                circ.center = (zone.center_x, zone.center_y)
+                circ.set_radius(suppression_radius)
+                circ.set_visible(True)
+            else:
+                rect = Rectangle(
+                    (zone.center_x - half, zone.center_y - half),
+                    2 * half,
+                    2 * half,
+                    facecolor=face,
+                    edgecolor=edge,
+                    linestyle="-",
+                    linewidth=1.6,
+                    alpha=0.80,
+                    zorder=2,
+                )
+                circ = Circle(
+                    (zone.center_x, zone.center_y),
+                    suppression_radius,
+                    fill=False,
+                    edgecolor=SUPPRESSION_EDGE,
+                    linestyle=":",
+                    linewidth=1.0,
+                    alpha=0.45,
+                    zorder=2,
+                )
                 tag = axis.text(
                     zone.center_x,
                     zone.center_y + half + 12.0,
@@ -663,21 +672,31 @@ class Viewer:
                     va="bottom",
                     zorder=7,
                 )
-                self._dynamic.append(tag)
+                axis.add_patch(rect)
+                axis.add_patch(circ)
+                pool.append((rect, circ, tag))
+            tag.set_position((zone.center_x, zone.center_y + half + 12.0))
+            tag.set_visible(bool(zone.proposed))
+        for j in range(len(existing_zones), len(pool)):
+            for artist in pool[j]:
+                try:
+                    artist.set_visible(False)
+                except (ValueError, AttributeError):
+                    pass
 
-        self._hover_zones = list(existing_zones)
-
-        # RAC events -----------------------------------------------------
-        if not events.empty:
-            try:
-                x = pd.to_numeric(events["X"], errors="coerce").to_numpy(dtype=float)
-                y = pd.to_numeric(events["Y"], errors="coerce").to_numpy(dtype=float)
-                lv = pd.to_numeric(events["Level"], errors="coerce").to_numpy(dtype=float)
-            except Exception:
-                x = events["X"].to_numpy()
-                y = events["Y"].to_numpy()
-                lv = events["Level"].to_numpy()
-            collection = axis.scatter(
+    def _sync_events(self, x, y, lv) -> None:
+        """Update the pooled RAC-event scatter collection in place."""
+        axis = self.map_axis
+        if len(x) == 0:
+            if self._event_scatter is not None:
+                try:
+                    self._event_scatter.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self._event_scatter = None
+            return
+        if self._event_scatter is None:
+            self._event_scatter = axis.scatter(
                 x,
                 y,
                 c=lv,
@@ -689,49 +708,150 @@ class Viewer:
                 alpha=0.95,
                 zorder=5,
             )
-            self._dynamic.append(collection)
+        else:
             try:
-                self._colorbar.update_normal(collection)
+                self._event_scatter.set_offsets(np.column_stack([x, y]))
+            except Exception:
+                try:
+                    self._event_scatter.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self._event_scatter = None
+                self._sync_events(x, y, lv)
+                return
+            try:
+                self._event_scatter.set_array(np.asarray(lv, dtype=float))
             except Exception:
                 pass
+        try:
+            self._colorbar.update_normal(self._event_scatter)
+        except Exception:
+            pass
+        self._style_colorbar()
 
-        # Qualifying clusters ---------------------------------------------
+    def _sync_clusters(self, clusters: list[Cluster]) -> None:
+        """Redraw cluster X marks (one pooled scatter) + pooled labels."""
+        axis = self.map_axis
+        if self._cluster_scatter is not None:
+            try:
+                self._cluster_scatter.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._cluster_scatter = None
+        points: list[tuple[float, float]] = []
         for cluster in clusters:
             avg_level = cluster.score / max(cluster.event_count, 1)
             lvl = max(1.0, min(5.0, float(avg_level)))
             x_rgba = self._severity_colormap(
                 self._severity_mappable.norm(lvl)
             )
-
             anchor = getattr(cluster, "anchor_zone", None)
             if anchor is not None:
                 draw_x, draw_y = anchor.center_x, anchor.center_y
             else:
                 draw_x, draw_y = cluster.center_x, cluster.center_y
-
-            mark = axis.scatter(
-                [draw_x],
-                [draw_y],
+            points.append((draw_x, draw_y, x_rgba, cluster))
+        if points:
+            self._cluster_scatter = axis.scatter(
+                [p[0] for p in points],
+                [p[1] for p in points],
                 marker="x",
-                color=x_rgba,
+                c=[p[2] for p in points],
                 s=120,
                 linewidths=2.2,
                 zorder=6,
             )
+        for i, (draw_x, draw_y, _rgba, cluster) in enumerate(points):
             avg_spd = getattr(cluster, "average_speed_kmh", None)
             speed_text = (
                 f"{float(avg_spd):.0f}"
                 if avg_spd and np.isfinite(float(avg_spd)) else "-"
             )
-            label = axis.text(
-                draw_x,
-                draw_y,
-                f" {cluster.event_count} evt, spd {speed_text}",
-                color="white",
-                fontsize=7,
-                zorder=7,
-            )
-            self._dynamic.extend([mark, label])
+            text = f" {cluster.event_count} evt, spd {speed_text}"
+            if i < len(self._cluster_labels):
+                label = self._cluster_labels[i]
+                label.set_position((draw_x, draw_y))
+                label.set_text(text)
+                label.set_visible(True)
+            else:
+                label = axis.text(
+                    draw_x,
+                    draw_y,
+                    text,
+                    color="white",
+                    fontsize=7,
+                    zorder=7,
+                )
+                self._cluster_labels.append(label)
+        for j in range(len(points), len(self._cluster_labels)):
+            try:
+                self._cluster_labels[j].set_visible(False)
+            except (ValueError, AttributeError):
+                pass
+
+    def update(
+        self,
+        events: pd.DataFrame,
+        lanes: pd.DataFrame,
+        clusters: list[Cluster],
+        existing_zones: list[ExistingZone],
+        suppression_radius: float,
+        zone_size: float,
+        grouping_radius: float,
+    ) -> None:
+        """Incremental redraw: pooled artists, cached lanes, skip identical frames."""
+        if not self.is_open():
+            return
+
+        axis = self.map_axis
+        self._rebuild_lanes(lanes)
+
+        # Event vectors (shared by the scatter pool + frame signature).
+        if not events.empty:
+            try:
+                ex = pd.to_numeric(events["X"], errors="coerce").to_numpy(dtype=float)
+                ey = pd.to_numeric(events["Y"], errors="coerce").to_numpy(dtype=float)
+                el = pd.to_numeric(events["Level"], errors="coerce").to_numpy(dtype=float)
+            except Exception:
+                ex = np.asarray(events["X"].to_numpy(), dtype=float)
+                ey = np.asarray(events["Y"].to_numpy(), dtype=float)
+                el = np.asarray(events["Level"].to_numpy(), dtype=float)
+            finite = np.isfinite(ex) & np.isfinite(ey)
+            ex, ey, el = ex[finite], ey[finite], el[finite]
+        else:
+            ex = ey = el = np.empty(0, dtype=float)
+
+        # Skip the entire frame when nothing changed (idle cycles are free).
+        newest = self.event_log[0] if self.event_log else None
+        frame_sig = (
+            self._lane_signature,
+            len(ex),
+            round(float(np.nansum(ex)), 1) if len(ex) else 0.0,
+            round(float(np.nansum(ey)), 1) if len(ey) else 0.0,
+            tuple(
+                (z.name, round(z.center_x, 1), round(z.center_y, 1),
+                 round(z.half_size, 1), bool(z.proposed))
+                for z in existing_zones
+            ),
+            tuple(
+                (round(c.center_x, 1), round(c.center_y, 1),
+                 c.event_count, round(c.score, 1))
+                for c in clusters
+            ),
+            len(self.event_log),
+            self._panel_scroll,
+            newest,
+        )
+        if frame_sig == self._frame_sig:
+            return
+        self._frame_sig = frame_sig
+
+        self._sync_zones(existing_zones, suppression_radius, zone_size)
+
+        self._hover_zones = list(existing_zones)
+
+        self._sync_events(ex, ey, el)
+        self._sync_clusters(clusters)
 
         # Frozen view: lanes define the footprint; set once, then never
         # touch the limits again (user pan/zoom is preserved).  The axes

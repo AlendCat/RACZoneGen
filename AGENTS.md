@@ -94,11 +94,11 @@ Key settings (`config.ini`):
     and the view is frozen from the lane footprint on first data (user
     pan/zoom is never stomped). Lanes draw as a *cached, decimated*
     PatchCollection (rebuilt only when lane data changes; ~10 ms cached
-    repaints), RAC events coloured by severity, square zones (magenta =
-    imported, blue + PROPOSED tag = proposed) + thin suppression rings,
-    cluster hubs, and a side data-entry
-    table listing the RAC events since start (time + X/Y + level + speed,
-    speeds normalized to km/h). Draws are throttled (200 ms min interval)
+    repaints). Events/zones/clusters draw from **pooled artists updated in
+    place** (scatter `set_offsets`/`set_array`, patch pool, label pool), and
+    **identical frames are skipped entirely** (~0.4 ms idle cycles). The
+    severity legend is pinned left (`_style_colorbar` re-applied after every
+    resync). Draws are throttled (200 ms min interval)
     and hover/resize handlers debounced so dragging never freezes.
 
 ## Zone naming
@@ -176,8 +176,13 @@ headless/service use.
 * `wait_with_viewer` pumps the GUI event loop while background MineStar
   tasks run, so the window never shows "Not responding" during the ~20 s
   `exportZones` subprocess.
-* Matplotlib must stay on the main thread; MineStar imports run on a
-  worker thread and never touch matplotlib.
+* Matplotlib must stay on the main thread; all blocking work runs on
+  workers — `poll_once` (RAC/lanes/zones reads + clustering) on the
+  2-worker poll pool with a pending-poll slot (slow DB never greys the
+  window; the result is picked up next loop), MineStar imports serialized
+  on their own 1-worker pool. `finish_cycle` (zone decisions + redraw) is
+  main-thread only. `run_cycle` = `poll_once` + `finish_cycle` synchronously
+  (kept for scripted/tests).
 * `mstarrun.bat` must be invoked via `cmd /d /c` (handled in
   `MineStar._command`).
 
