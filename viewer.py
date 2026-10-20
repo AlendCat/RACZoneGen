@@ -41,10 +41,23 @@ except Exception:
 
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
 
+logger = logging.getLogger("rac_zone_monitor")
+
 PALETE_BG = "#121418"
 PANEL_BG = "#0d0f12"
 TEXT_PRIMARY = "#EAEAEA"
 TEXT_GREY = "#9AA0A6"
+
+# Control-bar chip palette (matches the table header theme).
+CHIP_ACTIVE_FACE = "#1C2A24"
+CHIP_ACTIVE_EDGE = "#35C759"
+CHIP_ACTIVE_TEXT = "#8CFFA8"
+CHIP_OFF_FACE = "#14171B"
+CHIP_OFF_EDGE = "#3A444E"
+CHIP_OFF_TEXT = "#9AA0A6"
+CHIP_WARN_EDGE = "#E23B3B"
+CHIP_WARN_TEXT = "#FF9B9B"
+CHIP_HINT_TEXT = "#6E7681"
 
 # Fixed geometry — set once in __init__, never recomputed.  Fractions of
 # the figure, so resize scales everything proportionally with no jumps.
@@ -52,6 +65,7 @@ LAYOUT = {
     "colorbar": [0.040, 0.150, 0.018, 0.700],
     "map": [0.075, 0.080, 0.545, 0.840],
     "panel": [0.650, 0.080, 0.320, 0.840],
+    "controls": [0.650, 0.905, 0.320, 0.085],
 }
 
 ZONE_IMPORTED_FACE = "#C232A8"
@@ -106,6 +120,11 @@ class Viewer:
 
         self.map_axis = self.figure.add_axes(LAYOUT["map"])
         self.panel_axis = self.figure.add_axes(LAYOUT["panel"])
+        self._controls_axis = self.figure.add_axes(LAYOUT["controls"])
+        self._controls_axis.set_facecolor(PANEL_BG)
+        self._controls_axis.set_xlim(0, 1)
+        self._controls_axis.set_ylim(0, 1)
+        self._controls_axis.axis("off")
 
         self.map_axis.set_facecolor(PALETE_BG)
         # Equal units, fixed box: extra data space pads the limits instead
@@ -122,6 +141,19 @@ class Viewer:
         )
         self._event_coords: deque[tuple[float, float]] = deque(maxlen=100)
         self._panel_scroll: int = 0
+
+        # ---- Runtime user controls (control bar above the table) ---------
+        # creation_enabled: pause/resume zone creation. visible_levels:
+        # display-only severity filter for the MAP and the table. Zone-
+        # severity selection itself is config-only ([rac] cluster_levels).
+        self.creation_enabled: bool = True
+        # Display filter covers severities 1-5 (level 0 does not occur in
+        # real RAC data; unparsable/0 levels always stay visible).
+        self.visible_levels: set[int] = {1, 2, 3, 4, 5}
+        self._chips: list[tuple[dict, Rectangle]] = []
+        self._panel_rows: list = []
+        self._hover_event_data: tuple | None = None
+        self._last_frame: dict | None = None
 
         self._lane_collection: PatchCollection | None = None
         self._lane_signature: object = None
@@ -196,6 +228,7 @@ class Viewer:
 
         # Draw the (empty) table immediately so the right panel is never a
         # white flash on startup.
+        self._draw_controls()
         self._draw_panel()
         self.figure.canvas.draw_idle()
 
@@ -250,6 +283,9 @@ class Viewer:
     def _on_button_press(self, event) -> None:
         if getattr(event, "button", None) != 1:
             return
+        if getattr(event, "inaxes", None) is self._controls_axis:
+            self._on_controls_click(event)
+            return
         in_panel = getattr(event, "inaxes", None) is self.panel_axis or self._point_in_panel(event)
         if in_panel:
             try:
@@ -265,16 +301,14 @@ class Viewer:
                 visible_index = int((top - header_height - y) // row_height)
                 if visible_index < 0:
                     return
-                total = len(self.event_log)
+                pairs = self._panel_rows
+                total = len(pairs)
                 if total == 0:
                     return
                 log_index = self._panel_scroll + visible_index
                 if log_index < 0 or log_index >= total:
                     return
-                coords = list(self._event_coords)
-                if log_index >= len(coords):
-                    return
-                rx, ry = coords[log_index]
+                rx, ry = pairs[log_index][1]
                 self._zoom_to_point(rx, ry)
             except Exception:
                 pass
@@ -331,6 +365,24 @@ class Viewer:
                 self._zone_annotation.set_visible(False)
                 self._request_draw(force=True)
             return
+
+        # Event dots first: unit · speed · severity tooltip.
+        hit = self._event_dot_hit(event)
+        if hit is not None:
+            machine, speed, level, hit_x, hit_y = hit
+            if np.isfinite(speed) and speed > 0:
+                speed_text = f"{speed:.0f} km/h"
+            else:
+                speed_text = "speed ?"
+            self._zone_annotation.xy = (hit_x, hit_y)
+            self._zone_annotation.set_text(
+                f"{machine} · {speed_text} · Lv {level}"
+            )
+            if not self._zone_annotation.get_visible():
+                self._zone_annotation.set_visible(True)
+                self._request_draw(force=True)
+            return
+
         for zone in self._hover_zones:
             half = max(zone.half_size, 50.0)
             if abs(xdata - zone.center_x) <= half and abs(ydata - zone.center_y) <= half:
@@ -352,6 +404,39 @@ class Viewer:
         self._pan_xlim = None
         self._pan_ylim = None
 
+    def _event_dot_hit(self, event) -> tuple | None:
+        """Nearest RAC-event dot within ~10 px, else None."""
+        data = self._hover_event_data
+        if not data:
+            return None
+        ex, ey, el, machines, speeds = data
+        if len(ex) == 0:
+            return None
+        try:
+            display_points = self.map_axis.transData.transform(
+                np.column_stack([ex, ey])
+            )
+        except Exception:
+            return None
+        cursor = np.array(
+            [getattr(event, "x", None), getattr(event, "y", None)],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(cursor)):
+            return None
+        deltas = display_points - cursor
+        squared = (deltas * deltas).sum(axis=1)
+        index = int(np.argmin(squared))
+        if squared[index] > 100.0:  # ~10 px radius
+            return None
+        return (
+            str(machines[index]),
+            float(speeds[index]),
+            int(np.clip(round(float(el[index])), 0, 9)),
+            float(ex[index]),
+            float(ey[index]),
+        )
+
     def _point_in_panel(self, event) -> bool:
         try:
             bbox = self.panel_axis.bbox
@@ -362,6 +447,157 @@ class Viewer:
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # Control bar (pause · min severity · table level filter)
+    # ------------------------------------------------------------------
+
+    def _draw_controls(self) -> None:
+        """Render the themed control strip above the side table."""
+        axis = self._controls_axis
+        axis.clear()
+        axis.set_facecolor(PANEL_BG)
+        axis.set_xlim(0, 1)
+        axis.set_ylim(0, 1)
+        axis.axis("off")
+        self._chips = []
+
+        def add_chip(x, y, w, h, text, active, kind=None, value=None,
+                     warn=False):
+            if active:
+                face = CHIP_ACTIVE_FACE
+                edge = CHIP_WARN_EDGE if warn else CHIP_ACTIVE_EDGE
+                text_color = CHIP_WARN_TEXT if warn else CHIP_ACTIVE_TEXT
+            else:
+                face, edge, text_color = (
+                    CHIP_OFF_FACE, CHIP_OFF_EDGE, CHIP_OFF_TEXT
+                )
+            rect = Rectangle(
+                (x, y),
+                w,
+                h,
+                facecolor=face,
+                edgecolor=edge,
+                linewidth=1.0,
+                transform=axis.transAxes,
+                zorder=2,
+                clip_on=False,
+            )
+            axis.add_patch(rect)
+            axis.text(
+                x + w / 2.0,
+                y + h / 2.0,
+                text,
+                va="center",
+                ha="center",
+                color=text_color,
+                fontsize=7.0,
+                fontfamily="monospace",
+                fontweight="bold" if active else "normal",
+                transform=axis.transAxes,
+                zorder=3,
+            )
+            if kind is not None:
+                self._chips.append(
+                    ({"kind": kind, "value": value}, rect)
+                )
+            return x + w + 0.015
+
+        row1_y, row1_h = 0.55, 0.40
+        row2_y, row2_h = 0.05, 0.40
+
+        # Row 1: zone-creation toggle, anchored right ----------------------
+        create_w = 0.27
+        add_chip(
+            0.98 - 0.015 - create_w, row1_y, create_w, row1_h,
+            "CREATE ZONES: OFF" if not self.creation_enabled
+            else "CREATE ZONES: ON",
+            kind="create",
+            active=True,
+            warn=not self.creation_enabled,
+        )
+
+        # Row 2: severity display filter (map + table) ---------------------
+        axis.text(
+            0.02,
+            row2_y + row2_h / 2.0,
+            "Filter by Severity:",
+            va="center", ha="left", color="#FFFFFF",
+            fontsize=9.0, fontfamily="monospace",
+            transform=axis.transAxes, zorder=3,
+        )
+        # Chips anchored from the right edge so the label can never run
+        # into them at smaller window sizes.
+        chip_w, chip_gap = 0.085, 0.015
+        edge = 0.98
+        for level in (5, 4, 3, 2, 1):
+            chip_x = edge - chip_gap - chip_w
+            add_chip(
+                chip_x, row2_y, chip_w, row2_h,
+                str(level),
+                kind="level",
+                value=level,
+                active=(level in self.visible_levels),
+            )
+            edge = chip_x
+
+    def _on_controls_click(self, event) -> None:
+        """Handle clicks on the control-bar chips (axis data coords 0-1)."""
+        x, y = getattr(event, "xdata", None), getattr(event, "ydata", None)
+        if x is None or y is None:
+            return
+        for meta, rect in self._chips:
+            bx, by = rect.get_xy()
+            bw, bh = rect.get_width(), rect.get_height()
+            if not (bx <= x <= bx + bw and by <= y <= by + bh):
+                continue
+            kind = meta.get("kind")
+            value = meta.get("value")
+            if kind == "create":
+                self.creation_enabled = not self.creation_enabled
+                logger.info(
+                    "User control: zone creation -> %s.",
+                    "ENABLED" if self.creation_enabled else "PAUSED",
+                )
+            elif kind == "minsev":
+                value = int(value)
+                self.min_severity = (
+                    0 if self.min_severity == value else value
+                )
+                logger.info(
+                    "User control: minimum zone severity -> %s.",
+                    f">= {self.min_severity}" if self.min_severity else "OFF",
+                )
+            elif kind == "level":
+                value = int(value)
+                if value in self.visible_levels:
+                    if len(self.visible_levels) == 1:
+                        # Never blank the map/table on the user.
+                        self.visible_levels = {1, 2, 3, 4, 5}
+                    else:
+                        self.visible_levels.discard(value)
+                else:
+                    self.visible_levels.add(value)
+                logger.info(
+                    "User control: severity display filter -> %s.",
+                    ", ".join(
+                        str(level) for level in sorted(self.visible_levels)
+                    ),
+                )
+            # Force a full map/panel resync and apply it right now so the
+            # dots respond instantly, not on the next poll.
+            self._frame_sig = None
+            if self._last_frame is not None:
+                try:
+                    self.update(**self._last_frame)
+                except Exception:
+                    logger.exception(
+                        "Map resync after filter change failed."
+                    )
+            self._draw_controls()
+            self._draw_panel()
+            self._request_draw(force=True)
+            return
+
     def _on_scroll(self, event) -> None:
         in_panel = getattr(event, "inaxes", None) is self.panel_axis or self._point_in_panel(event)
         if in_panel:
@@ -370,7 +606,7 @@ class Viewer:
             bottom_margin = 0.02
             row_height = 0.05
             max_rows = int((top - header_height - bottom_margin) // row_height)
-            total = len(self.event_log)
+            total = len(self._panel_rows) or len(self.event_log)
             max_offset = max(0, total - max_rows)
             if max_offset == 0:
                 return
@@ -806,6 +1042,17 @@ class Viewer:
             return
 
         axis = self.map_axis
+        # Keep the args so chip clicks can re-sync the map immediately
+        # without waiting for the next poll cycle.
+        self._last_frame = dict(
+            events=events,
+            lanes=lanes,
+            clusters=clusters,
+            existing_zones=existing_zones,
+            suppression_radius=suppression_radius,
+            zone_size=zone_size,
+            grouping_radius=grouping_radius,
+        )
         self._rebuild_lanes(lanes)
 
         # Event vectors (shared by the scatter pool + frame signature).
@@ -819,9 +1066,62 @@ class Viewer:
                 ey = np.asarray(events["Y"].to_numpy(), dtype=float)
                 el = np.asarray(events["Level"].to_numpy(), dtype=float)
             finite = np.isfinite(ex) & np.isfinite(ey)
-            ex, ey, el = ex[finite], ey[finite], el[finite]
         else:
             ex = ey = el = np.empty(0, dtype=float)
+            finite = np.empty(0, dtype=bool)
+        # Severity DISPLAY filter: the shortfall chips hide dots on the map
+        # exactly like they hide table rows. Unparsable levels stay visible.
+        # (Zone-cluster severity is config [rac] cluster_levels — separate.)
+        if self.visible_levels and len(el):
+            level_int = np.rint(
+                np.nan_to_num(el, nan=-9999.0)
+            ).astype(int)
+            in_set = np.isin(
+                level_int, np.fromiter(self.visible_levels, dtype=int)
+            )
+            # Level 0 / garbage levels: treat like unparsable, keep shown.
+            visible = (level_int < 1) | in_set
+        else:
+            visible = np.ones(len(ex), dtype=bool)
+        keep = finite & visible
+        ex, ey, el = ex[keep], ey[keep], el[keep]
+
+        # Hover payload for map dots: unit · speed · severity (aligned to
+        # the coordinate arrays the scatter actually draws).
+        try:
+            if "Machine" in events.columns:
+                machines = (
+                    events["Machine"]
+                    .fillna("-")
+                    .astype(str)
+                    .to_numpy(dtype=object)
+                )
+            else:
+                machines = np.full(len(events), "-", dtype=object)
+        except Exception:
+            machines = np.full(len(events), "-", dtype=object)
+        try:
+            speeds = (
+                pd.to_numeric(events.get("Speed"), errors="coerce")
+                .to_numpy(dtype=float)
+            )
+        except Exception:
+            speeds = np.full(len(events), np.nan, dtype=float)
+        machines = np.asarray(machines, dtype=object)
+        speeds = np.asarray(speeds, dtype=float)
+        # Labels must follow the SAME keep-mask that filtered the
+        # coordinates — drop positions, never just truncate prefixes.
+        if len(machines) == len(keep):
+            machines = machines[keep]
+        if len(speeds) == len(keep):
+            speeds = speeds[keep]
+        self._hover_event_data = (
+            np.asarray(ex, dtype=float),
+            np.asarray(ey, dtype=float),
+            np.asarray(el, dtype=float),
+            machines[: len(ex)],
+            speeds[: len(ex)],
+        )
 
         # Skip the entire frame when nothing changed (idle cycles are free).
         newest = self.event_log[0] if self.event_log else None
@@ -965,9 +1265,35 @@ class Viewer:
             edges.append(edges[-1] + w)
         centres = [(edges[i] + edges[i + 1]) / 2.0 for i in range(len(columns))]
 
-        rows = list(self.event_log)
+        rows_all = list(self.event_log)
+        coords_all = list(self._event_coords)
+
+        def _row_level(entry):
+            try:
+                return int(float(entry[2]))
+            except Exception:
+                return None
+
+        # Display-only filter: the Filter-by-Severity chips choose which
+        # severities appear on the map AND in this table. Level 0 or
+        # unparsable levels always stay visible (they do not occur in
+        # real data; a stray one should never silently vanish).
+        pairs = [
+            (row, coord)
+            for row, coord in zip(rows_all, coords_all)
+            if _row_level(row) is None
+            or _row_level(row) < 1
+            or _row_level(row) in self.visible_levels
+        ]
+        self._panel_rows = pairs
+        rows = [row for row, _ in pairs]
 
         if not rows:
+            message = (
+                "No RAC events since start"
+                if not rows_all
+                else "All levels hidden (severity chips)"
+            )
             panel.add_patch(
                 Rectangle(
                     (0.0, top - header_height),
@@ -998,7 +1324,7 @@ class Viewer:
             panel.text(
                 0.5,
                 0.5,
-                "No RAC events since start",
+                message,
                 va="center",
                 ha="center",
                 transform=panel.transAxes,

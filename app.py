@@ -33,7 +33,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from clustering import mark_new_events, update_persistent_clusters
+from clustering import (
+    filter_events_for_clustering,
+    mark_new_events,
+    update_persistent_clusters,
+)
 from config import Config
 from database import Database
 from minestar import (
@@ -172,8 +176,12 @@ def poll_once(
     if used_sigs is None:
         used_sigs = set()
 
+    # Cluster-severity allow-list (config [rac] cluster_levels). Display
+    # filter (map + table) is user-driven and lives in the viewer.
+    qualifying = filter_events_for_clustering(events, config.cluster_levels)
+
     persistent_clusters = update_persistent_clusters(
-        events,
+        qualifying,
         persistent_clusters,
         used_sigs,
         existing_zones,
@@ -277,22 +285,36 @@ def finish_cycle(
             for s, f in zip(sigs_all, events["_IsNew"]):
                 if f:
                     new_sigs_this_cycle.add(s)
+        # Runtime user controls: pause gate + (cluster filter runs in the
+        # poll worker via minimum_severity).
+        paused = viewer is not None and not getattr(
+            viewer, "creation_enabled", True
+        )
         actionable_clusters = []
-        for pc in persistent_clusters:
-            if pc.anchor_zone is not None:
-                continue
-            if pc.event_count < config.minimum_event_count:
-                continue
-            if pc.score < config.grouping_score:
-                continue
-            has_new = any(s in new_sigs_this_cycle for s in pc.member_sigs)
-            if not has_new:
-                continue
-            if cluster_is_suppressed(pc, existing_zones, config.suppression_radius_metres):
-                continue
-            actionable_clusters.append(pc)
+        if paused:
+            logger.info(
+                "Zone creation PAUSED by user: %d new RAC event(s) "
+                "observed; clusters still drawn. No zones created.",
+                new_event_count,
+            )
+        else:
+            for pc in persistent_clusters:
+                if pc.anchor_zone is not None:
+                    continue
+                if pc.event_count < config.minimum_event_count:
+                    continue
+                if pc.score < config.grouping_score:
+                    continue
+                has_new = any(s in new_sigs_this_cycle for s in pc.member_sigs)
+                if not has_new:
+                    continue
+                if cluster_is_suppressed(pc, existing_zones, config.suppression_radius_metres):
+                    continue
+                actionable_clusters.append(pc)
 
-        if not actionable_clusters:
+        if paused:
+            pass  # paused message already logged above
+        elif not actionable_clusters:
             logger.info(
                 "%d new RAC event(s) detected, but no group exceeded "
                 "the configured threshold. No action.",
@@ -572,6 +594,15 @@ def main() -> None:
         config.minimum_speed_kmh,
         config.maximum_speed_kmh,
         config.payload_speed_divisor,
+    )
+    cluster_levels_text = (
+        ", ".join(str(value) for value in sorted(config.cluster_levels))
+        or "all levels"
+    )
+    logger.info(
+        "Controls: zone creation ON | cluster levels: %s "
+        "(config [rac] cluster_levels)",
+        cluster_levels_text,
     )
     if getattr(config, "show_only", False):
         logger.info("Import mode: SHOW-ONLY (preview, mstarrun never runs)")

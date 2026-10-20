@@ -64,6 +64,11 @@ password =
 grouping_radius_metres = 50
 grouping_score = 8
 minimum_event_count = 5
+# Levels (0-5) allowed to FORM/JOIN a cluster for zone creation.
+# Comma-separated list. Empty = all levels count.
+# To ignore level-1 noise:  cluster_levels = 2,3,4,5
+# Full set (same as empty): cluster_levels = 1,2,3,4,5
+cluster_levels =
 [zone]
 output_directory = output
 zone_size_metres = 100
@@ -158,9 +163,14 @@ class Config:
         self.lane_query_file = (self.sql_directory / "lanes.sql").resolve()
         self.zones_query_file = (self.sql_directory / "zones.sql").resolve()
         self.time_cutoff_minutes = 120
+        raw_levels = parser.get("rac", "cluster_levels", fallback="")
         self.grouping_radius_metres = parser.getfloat("rac", "grouping_radius_metres")
         self.grouping_score = parser.getfloat("rac", "grouping_score")
         self.minimum_event_count = parser.getint("rac", "minimum_event_count")
+        # Levels allowed to FORM/JOIN a cluster (allow-list). Empty set =
+        # no filtering. e.g. {2,3,4,5} makes level-1 events invisible to
+        # zone creation (they still display on the map and table).
+        self.cluster_levels = self._parse_cluster_levels(raw_levels)
         self.top_n = 1000
         self.threshold_inclusive = True
         self.zone_output_directory = self._path("zone", "output_directory")
@@ -173,7 +183,7 @@ class Config:
         self.lane_refresh_interval_seconds = parser.getint("lanes", "refresh_interval_seconds")
         self.default_speed_kmh = 40
         self.speed_offset_kmh = 10.0
-        self.minimum_speed_kmh = 5.0
+        self.minimum_speed_kmh = 11.0
         self.maximum_speed_kmh = 60.0
         # Optional [speed] overrides (all have safe fallbacks so old
         # config.ini files without a [speed] section keep working).
@@ -272,6 +282,31 @@ class Config:
             result.append((x_value, y_value, level, speed))
         return result
 
+    def _parse_cluster_levels(self, raw: str) -> frozenset[int]:
+        """[rac] cluster_levels — allow-list of severities for clustering.
+
+        Accepts comma (or space/semicolon) separated integers, empty for
+        "all levels". Anything non-numeric or outside 0-5 is a hard error
+        so a typo never silently widens zone creation.
+        """
+        levels: set[int] = set()
+        for token in raw.replace(";", ",").replace(" ", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(float(token))
+            except ValueError:
+                raise ValueError(
+                    f"cluster_levels has a non-numeric entry: {token!r}"
+                )
+            if not 0 <= value <= 5:
+                raise ValueError(
+                    f"cluster_levels entry out of range 0-5: {value}"
+                )
+            levels.add(value)
+        return frozenset(levels)
+
     def validate(self) -> None:
         if self.poll_interval_seconds < 1:
             raise ValueError("poll_interval_seconds must be at least 1")
@@ -279,6 +314,11 @@ class Config:
             raise ValueError("grouping_radius_metres must be > 0")
         if self.minimum_event_count < 1:
             raise ValueError("minimum_event_count must be at least 1")
+        for level in self.cluster_levels:
+            if not 0 <= level <= 5:
+                raise ValueError(
+                    f"cluster_levels entry out of range 0-5: {level}"
+                )
         if self.zone_size_metres <= 0:
             raise ValueError("zone_size_metres must be > 0")
         if self.suppression_radius_metres < 0:

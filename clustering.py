@@ -96,6 +96,30 @@ def event_signatures(
     return signatures
 
 
+def filter_events_for_clustering(
+    events: pd.DataFrame,
+    cluster_levels: frozenset[int] | set[int] | None,
+) -> pd.DataFrame:
+    """
+    Keep only events whose severity may form or join a zone cluster.
+
+    ``cluster_levels`` is a config-only allow-list ([rac]
+    ``cluster_levels``): an empty/None set disables the filter, any other
+    set keeps only events whose Level is listed (Levels that fail to
+    parse never cluster). This is an algorithm-level filter, not a
+    display filter — excluded events still appear on the map and in the
+    side table.
+    """
+    if not cluster_levels or events.empty:
+        return events
+    try:
+        levels = pd.to_numeric(events["Level"], errors="coerce").round()
+    except (KeyError, ValueError, TypeError):
+        return events
+    keep = levels.isin([float(value) for value in cluster_levels])
+    return events.loc[keep]
+
+
 def mark_new_events(
     events: pd.DataFrame,
     previous_counts: Counter | None,
