@@ -117,7 +117,7 @@ class Viewer:
             spine.set_edgecolor(TEXT_GREY)
             spine.set_linewidth(1.2)
 
-        self.event_log: deque[tuple[str, str, str, str, str]] = deque(
+        self.event_log: deque[tuple[str, str, str, str]] = deque(
             maxlen=100
         )
         self._event_coords: deque[tuple[float, float]] = deque(maxlen=100)
@@ -456,6 +456,9 @@ class Viewer:
         """Add a single RAC event row to the panel (newest at top)."""
         time_text = pd.Timestamp(row["Time"]).strftime("%H:%M:%S")
         speed_text = _fmt_speed(row.get("Speed"))
+        unit = row.get("Machine")
+        unit_text = str(unit).strip() if pd.notna(unit) else ""
+        unit_text = unit_text if unit_text else "-"
         raw_x = float(row["X"])
         raw_y = float(row["Y"])
         was_at_top = self._panel_scroll == 0
@@ -463,8 +466,7 @@ class Viewer:
         self.event_log.appendleft(
             (
                 time_text,
-                _compact_coord(raw_x),
-                _compact_coord(raw_y),
+                unit_text,
                 f"{int(row['Level'])}",
                 speed_text,
             )
@@ -953,8 +955,8 @@ class Viewer:
         fontsize = 9.0
         header_fontsize = 9.0
 
-        weights = [0.22, 0.26, 0.26, 0.10, 0.16]
-        columns = ["TIME", "X", "Y", "Lv", "km/h"]
+        weights = [0.30, 0.40, 0.12, 0.18]
+        columns = ["TIME", "UNIT", "Lv", "km/h"]
         usable = right - left
         total_w = sum(weights)
         norm = [w / total_w * usable for w in weights]
@@ -1061,7 +1063,7 @@ class Viewer:
                 )
 
             try:
-                lvl_val = int(float(values[3]))
+                lvl_val = int(float(values[2]))
             except Exception:
                 lvl_val = 0
             if lvl_val <= 2:

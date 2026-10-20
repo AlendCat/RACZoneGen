@@ -41,6 +41,16 @@ from database import Database, _payload_speed
 
 logger = logging.getLogger("rac_zone_monitor")
 
+# Fake unit names so synthetic events look realistic in the side panel.
+_SIMULATED_MACHINES = (
+    "SIM789",
+    "SIM790",
+    "SIM791",
+    "SIM792",
+    "SKM101",
+    "SKM102",
+)
+
 
 class SimulatedDatabase:
     """
@@ -163,7 +173,7 @@ class SimulatedDatabase:
 
         events = pd.DataFrame(
             self._events,
-            columns=["Time", "X", "Y", "Level", "Payload"],
+            columns=["Time", "X", "Y", "Machine", "Level", "Payload"],
         )
 
         if events.empty:
@@ -254,6 +264,13 @@ class SimulatedDatabase:
                         "Time": now,
                         "X": event_x,
                         "Y": event_y,
+                        "Machine": _SIMULATED_MACHINES[
+                            int(
+                                self._rng.integers(
+                                    0, len(_SIMULATED_MACHINES)
+                                )
+                            )
+                        ],
                         "Level": level,
                         "Payload": json.dumps(
                             {

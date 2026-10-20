@@ -33,6 +33,12 @@ mkdir "dist\sql" 2>nul
 copy /Y "sql\rac_events.sql" "dist\sql\rac_events.sql"
 copy /Y "sql\lanes.sql" "dist\sql\lanes.sql"
 copy /Y "sql\zones.sql" "dist\sql\zones.sql"
+
+if exist "dist\HVC_sql" (
+    if exist "sql_HVC\rac_events.sql" copy /Y "sql_HVC\rac_events.sql" "dist\HVC_sql\rac_events.sql"
+    if exist "sql_HVC\lanes.sql" copy /Y "sql_HVC\lanes.sql" "dist\HVC_sql\lanes.sql"
+    if exist "sql_HVC\zones.sql" copy /Y "sql_HVC\zones.sql" "dist\HVC_sql\zones.sql"
+)
 mkdir "dist\sql_HVC" 2>nul
 copy /Y "sql_HVC\rac_events.sql" "dist\sql_HVC\rac_events.sql"
 copy /Y "sql_HVC\lanes.sql" "dist\sql_HVC\lanes.sql"

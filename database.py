@@ -211,6 +211,24 @@ class Database:
             ["Time", "X", "Y", "Level", "Payload"],
         )
 
+        # Vehicle name is optional (added via the V_MACHINE join in
+        # rac_events.sql). Older SQL files without the join still work —
+        # the panel falls back to "-" instead of failing startup.
+        machine_actual = {
+            str(column).strip().lower(): column
+            for column in events.columns
+        }.get("machine")
+
+        if machine_actual is not None:
+            events = events.rename(columns={machine_actual: "Machine"})
+        else:
+            events["Machine"] = ""
+
+        events["Machine"] = (
+            events["Machine"].fillna("").astype(str).str.strip()
+        )
+        events.loc[events["Machine"] == "", "Machine"] = "-"
+
         events["Time"] = pd.to_datetime(
             events["Time"],
             errors="coerce",
